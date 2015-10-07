@@ -1,12 +1,18 @@
+#include <linux/delay.h>
 #include <linux/init.h>
-#include <linux/mm.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/perf_event.h>
-#include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/vmalloc.h>
+
+#if 0
+#include <linux/mm.h>
+#include <linux/sched.h>
 #include <linux/random.h>
 
 #include <asm/cacheflush.h>
+#endif
 #include <asm/tlbflush.h>
 
 #ifndef CONFIG_X86
@@ -15,145 +21,164 @@
 
 MODULE_LICENSE("GPL");
 
-static uint iterations = 1000;
+static uint iterations = 10000;
 module_param(iterations, uint, S_IRUGO);
 
-static bool is_tlb_flush = 1;
-module_param(is_tlb_flush, bool, S_IRUGO);
+static bool tlb_flush = 1;
+module_param(tlb_flush, bool, S_IRUGO);
 
-static struct perf_event_attr tlb_flush_event_attr = {
+static struct perf_event_attr tlb_miss_event_attr = {
 	.type           = PERF_TYPE_RAW,
-	.config         = 0x01bd, /* STLB Flush: 0x20bd, DTLB Flush:0x01bd,
-								 ITLB Flush: 0x01ae */
+	.config         = 0x0108, /* perf_event_intel.c:610,
+	                             SNB_DTLB_READ_MISS_TO_PTW: 0x0108
+				     SNB_ITLB_READ_MISS_TO_PTW: 0x0185
+				   */
 	.size           = sizeof(struct perf_event_attr),
 	.pinned         = 1,
 	.disabled       = 1,
 };
 
-static int __init bench_init(void)
-{
+
+struct test {
 	volatile char * data;
-	uint i;
-	char res = 0;
-	int cpu;
-	ulong irqs;
+	struct kref refcount;
+	struct semaphore accesses;
+	struct semaphore invalidations;
+};
 
-	struct perf_event *tlb_flush;
+static void release_test(struct kref *ref)
+{
+	struct test *t = container_of(ref, struct test, refcount);
+	pr_info("Releasing test struct\n");
+	vfree((void*)t->data);
+	kfree(t);
+}
 
-	u64 tlb_flushes_begin, tlb_flushes_end, enabled, running;
+static int test_invalidator(void* data)
+{
+	struct test *t = data;
+	int cpu = smp_processor_id();
+	int i;
 
-	unsigned long cr4;
-	unsigned long addr;
-	struct mm_struct *mm;
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *ptep, pte;
+	pr_info("Test invalidator on cpu %d\n", cpu);
 
-	cr4 = native_read_cr4();
-
-	pr_info("CR4 is: %lx\n", cr4);
-
-	pr_info("Allocating memory\n");
-	data = vmalloc(PAGE_SIZE);
-	if (!data) {
-		pr_err("Failed to allocate memory");
-		goto out;
-	}
-	pr_info("Address: %p\n", data);
-
-	/* Access data to put it inside TLB  */
-	res = data[0];
-
-	/* Change data from global page to non-global page */
-	addr = (unsigned long) data;
-	mm = get_task_mm(current);
-	if (!mm)
-	{
-		pr_err("Failed to get task mm\n");
-		goto out_free;
-	}
-
-	pgd = pgd_offset(current->mm, addr);
-	if (!pgd_none(*pgd))
-	{
-		pud = pud_offset(pgd, addr);
-		if (!pud_none(*pud))
-		{
-			pmd = pmd_offset(pud, addr);
-			if (!pmd_none(*pmd))
-			{
-				ptep = pte_offset_map(pmd, addr);
-				pte = *ptep;
-				pr_info("PTE before: %lx\n", pte.pte);
-				pte.pte = pte.pte & ~_PAGE_GLOBAL;
-				pr_info("PTE after: %lx\n", pte.pte);
-				*ptep = pte;
-			}
+	for (i = 0; i < iterations; ++i) {
+		down(&t->accesses);
+		if (tlb_flush) {
+			__flush_tlb_single((uintptr_t)t->data);
+//			pr_info("Consumed access, produced invalidation: %u\n", i);
 		}
+		up(&t->invalidations);
 	}
+	pr_info("Invalidator done\n");
+//	put_cpu();
+	kref_put(&t->refcount, release_test);
+	return 1;
+}
 
-	/* Disable interrupts */
-	cpu = get_cpu();
-	/* Setup TLB miss, and cache miss counters */
-	tlb_flush = perf_event_create_kernel_counter(&tlb_flush_event_attr,
+static int test_accessor(void* data)
+{
+	struct test *t = data;
+	volatile char * d = t->data;
+	struct perf_event *tlb_miss;
+	int cpu = smp_processor_id();
+	unsigned i;
+	int ret;
+	u64 tlb_misses_begin, tlb_misses_end, running, enabled;
+
+	pr_info("Test accessor on cpu %d\n", cpu);
+
+	/* Setup TLB miss counter */
+	tlb_miss = perf_event_create_kernel_counter(&tlb_miss_event_attr,
 		cpu, NULL, NULL, NULL);
-	if (IS_ERR(tlb_flush)) {
+	if (IS_ERR(tlb_miss)) {
 		pr_err("Failed to create kernel counter\n");
 		goto out_putcpu;
 	}
+	perf_event_enable(tlb_miss);
 
-	pr_info("get_cpu: %d\n", cpu);
-
-	perf_event_enable(tlb_flush);
-
-	local_irq_save(irqs);
+//	local_irq_save(irqs);
 	/* Read TLB miss and Cache miss counters */
-	tlb_flushes_begin = perf_event_read_value(tlb_flush, &enabled, &running);
-
-	get_random_bytes((void*)data, PAGE_SIZE);
-
+	tlb_misses_begin = perf_event_read_value(tlb_miss, &enabled, &running);
 	for (i = 0; i < iterations; ++i) {
-		/* Flush TLB entry */
-		if (is_tlb_flush)
-		{
-			/*cr4 = native_read_cr4();*/
-			/*native_write_cr4(cr4);*/
-			__flush_tlb_single((uintptr_t)data);
-			/*__flush_tlb_all();*/
-		}
-
-		/* Access data to trigger page walk */
-		res ^= data[i];
-
+		down(&t->invalidations);
+//		pr_info("Consumed invalidation, produced access: %u\n", i);
+		ret = (ret << 1) ^d[0];
+		up(&t->accesses);
 	}
 
-	pr_info("res is: %c\n", res);
+	tlb_misses_end = perf_event_read_value(tlb_miss, &enabled, &running);
 
-	/* Read the counters again */
-	tlb_flushes_end = perf_event_read_value(tlb_flush, &enabled, &running);
-	local_irq_restore(irqs);
+
+//	local_irq_restore(irqs);
 
 	/* Print results */
-	pr_info("TLB Flushes: %llu (%llu - %llu)\n",
-		tlb_flushes_end - tlb_flushes_begin,
-		tlb_flushes_end, tlb_flushes_begin);
+	pr_info("Iterations: %d\n", iterations);
+	pr_info("TLB misses: %llu (%llu - %llu)\n",
+		tlb_misses_end - tlb_misses_begin,
+		tlb_misses_end, tlb_misses_begin);
 
 	/* Clean up counters */
-	perf_event_disable(tlb_flush);
+	perf_event_disable(tlb_miss);
 
-	perf_event_release_kernel(tlb_flush);
-
+	perf_event_release_kernel(tlb_miss);
 out_putcpu:
-	/* Enable interrupts */
-	put_cpu();
-/*out_unmappte:*/
-/*out_putmm:*/
-out_free:
-	pr_info("Freeing allocated memory\n");
-	vfree((void*)data);
-out:
+	pr_info("Accessor done\n");
+//	put_cpu();
+	kref_put(&t->refcount, release_test);
 	return 0;
+}
+
+static int __init bench_init(void)
+{
+	struct task_struct *t1, *t2;
+	struct test * t;
+
+	pr_info("Hello World!\n");
+	t = kzalloc(sizeof(struct test), GFP_KERNEL);
+	if (!t)
+		goto out;
+
+	t->data = vmalloc(PAGE_SIZE);
+	if (!t->data)
+		goto out_free;
+
+	/* add reference for both threads */
+	kref_init(&t->refcount);
+	kref_get(&t->refcount);
+
+	/* init semaphores */
+	t->data[0] = 0x5;
+	sema_init(&t->accesses, 1);
+	sema_init(&t->invalidations, 0);
+
+
+	t1 = kthread_create(test_invalidator, t, "test_invalidator");
+	if (IS_ERR(t1))
+		goto out_vfree;
+
+	t2 = kthread_create(test_accessor, t, "test_accessor");
+	if (IS_ERR(t2))
+		goto out_stop1;
+
+	kthread_bind(t1, 0);
+	kthread_bind(t2, 1);
+	wake_up_process(t1);
+	wake_up_process(t2);
+
+	pr_info("init done\n");
+	return 0;
+
+	kthread_stop(t2);
+out_stop1:
+	kthread_stop(t1);
+out_vfree:
+	vfree((void*)t->data);
+out_free:
+	kfree(t);
+out:
+	pr_warning("Something went wrong\n");
+	return 1;
 }
 
 static void __exit bench_exit(void)
