@@ -1,3 +1,4 @@
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/kthread.h>
@@ -42,8 +43,8 @@ static struct perf_event_attr tlb_miss_event_attr = {
 struct test {
 	volatile char * data;
 	struct kref refcount;
-	struct semaphore accesses;
-	struct semaphore invalidations;
+	atomic_t accesses;
+	atomic_t invalidations;
 };
 
 static void release_test(struct kref *ref)
@@ -57,21 +58,21 @@ static void release_test(struct kref *ref)
 static int test_invalidator(void* data)
 {
 	struct test *t = data;
-	int cpu = smp_processor_id();
+	int cpu = get_cpu();
 	int i;
 
 	pr_info("Test invalidator on cpu %d\n", cpu);
 
 	for (i = 0; i < iterations; ++i) {
-		down(&t->accesses);
+		while (atomic_xchg(&t->accesses, 0) == 0);
 		if (tlb_flush) {
 			__flush_tlb_single((uintptr_t)t->data);
 //			pr_info("Consumed access, produced invalidation: %u\n", i);
 		}
-		up(&t->invalidations);
+		atomic_set(&t->invalidations, 1);
 	}
 	pr_info("Invalidator done\n");
-//	put_cpu();
+	put_cpu();
 	kref_put(&t->refcount, release_test);
 	return 1;
 }
@@ -81,7 +82,7 @@ static int test_accessor(void* data)
 	struct test *t = data;
 	volatile char * d = t->data;
 	struct perf_event *tlb_miss;
-	int cpu = smp_processor_id();
+	int cpu = get_cpu();
 	unsigned i;
 	int ret;
 	u64 tlb_misses_begin, tlb_misses_end, running, enabled;
@@ -101,10 +102,10 @@ static int test_accessor(void* data)
 	/* Read TLB miss and Cache miss counters */
 	tlb_misses_begin = perf_event_read_value(tlb_miss, &enabled, &running);
 	for (i = 0; i < iterations; ++i) {
-		down(&t->invalidations);
+		while (atomic_xchg(&t->invalidations, 0) == 0);
 //		pr_info("Consumed invalidation, produced access: %u\n", i);
 		ret = (ret << 1) ^d[0];
-		up(&t->accesses);
+		atomic_set(&t->accesses, 1);
 	}
 
 	tlb_misses_end = perf_event_read_value(tlb_miss, &enabled, &running);
@@ -113,7 +114,7 @@ static int test_accessor(void* data)
 //	local_irq_restore(irqs);
 
 	/* Print results */
-	pr_info("Iterations: %d\n", iterations);
+	pr_info("Iterations: %u\n", iterations);
 	pr_info("TLB misses: %llu (%llu - %llu)\n",
 		tlb_misses_end - tlb_misses_begin,
 		tlb_misses_end, tlb_misses_begin);
@@ -124,7 +125,7 @@ static int test_accessor(void* data)
 	perf_event_release_kernel(tlb_miss);
 out_putcpu:
 	pr_info("Accessor done\n");
-//	put_cpu();
+	put_cpu();
 	kref_put(&t->refcount, release_test);
 	return 0;
 }
@@ -149,8 +150,8 @@ static int __init bench_init(void)
 
 	/* init semaphores */
 	t->data[0] = 0x5;
-	sema_init(&t->accesses, 1);
-	sema_init(&t->invalidations, 0);
+	atomic_set(&t->accesses, 1);
+	atomic_set(&t->invalidations, 0);
 
 
 	t1 = kthread_create(test_invalidator, t, "test_invalidator");
