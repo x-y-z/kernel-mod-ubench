@@ -144,6 +144,11 @@ static int __init bench_init(void)
 	struct test * t;
 
 	pr_info("Hello World!\n");
+	if (core1 == core2) {
+		pr_err("Running both threads on the same core will hang your "
+		       "machine.\n");
+		return -EINVAL;
+	}
 	t = kzalloc(sizeof(struct test), GFP_KERNEL);
 	if (!t)
 		goto out;
