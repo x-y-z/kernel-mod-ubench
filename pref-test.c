@@ -48,7 +48,7 @@ static struct perf_event_attr tlb_miss_event_attr = {
 
 
 struct test {
-	volatile char * data;
+	char * data;
 	struct kref refcount;
 	atomic_t accesses;
 	atomic_t invalidations;
@@ -58,7 +58,7 @@ static void release_test(struct kref *ref)
 {
 	struct test *t = container_of(ref, struct test, refcount);
 	pr_info("Releasing test struct\n");
-	vfree((void*)t->data);
+	vfree(t->data);
 	kfree(t);
 }
 
@@ -182,7 +182,7 @@ static int __init bench_init(void)
 out_stop1:
 	kthread_stop(t1);
 out_vfree:
-	vfree((void*)t->data);
+	vfree(t->data);
 out_free:
 	kfree(t);
 out:
