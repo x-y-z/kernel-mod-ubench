@@ -28,9 +28,16 @@ module_param(iterations, uint, S_IRUGO);
 static bool tlb_flush = 1;
 module_param(tlb_flush, bool, S_IRUGO);
 
+static uint core1 = 0;
+module_param(core1, uint, S_IRUGO);
+
+static uint core2 = 1;
+module_param(core2, uint, S_IRUGO);
+
 static struct perf_event_attr tlb_miss_event_attr = {
-	.type           = PERF_TYPE_RAW,
-	.config         = 0x0108, /* perf_event_intel.c:610,
+	.type           = PERF_TYPE_HW_CACHE,
+	.config		= PERF_COUNT_HW_CACHE_DTLB | PERF_COUNT_HW_CACHE_OP_READ << 8 | PERF_COUNT_HW_CACHE_RESULT_MISS << 16,
+/*	.config         = 0x0108, /* perf_event_intel.c:610,
 	                             SNB_DTLB_READ_MISS_TO_PTW: 0x0108
 				     SNB_ITLB_READ_MISS_TO_PTW: 0x0185
 				   */
@@ -84,7 +91,7 @@ static int test_accessor(void* data)
 	struct perf_event *tlb_miss;
 	int cpu = get_cpu();
 	unsigned i;
-	int ret;
+	int ret = 0;
 	u64 tlb_misses_begin, tlb_misses_end, running, enabled;
 
 	pr_info("Test accessor on cpu %d\n", cpu);
@@ -115,6 +122,7 @@ static int test_accessor(void* data)
 
 	/* Print results */
 	pr_info("Iterations: %u\n", iterations);
+	pr_info("Result: %u\n", ret);
 	pr_info("TLB misses: %llu (%llu - %llu)\n",
 		tlb_misses_end - tlb_misses_begin,
 		tlb_misses_end, tlb_misses_begin);
@@ -162,8 +170,8 @@ static int __init bench_init(void)
 	if (IS_ERR(t2))
 		goto out_stop1;
 
-	kthread_bind(t1, 0);
-	kthread_bind(t2, 1);
+	kthread_bind(t1, core1);
+	kthread_bind(t2, core2);
 	wake_up_process(t1);
 	wake_up_process(t2);
 
