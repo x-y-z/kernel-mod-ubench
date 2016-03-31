@@ -123,6 +123,8 @@ int copy_page_thread(void *data)
 	while (!kthread_should_stop()) {
 		for (j = 0; j < 1024; ++j)
 			copy_pages_nocache(end_page[i]+j, start_page[i]+j);
+		/* make watchdog happy  */
+		cond_resched();
 	}
 
 	return 0;
