@@ -11,6 +11,7 @@
 
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
+#include <asm/fpu/api.h>
 
 #ifndef CONFIG_X86
 # error "This module only works on X86"
