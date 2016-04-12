@@ -9,6 +9,7 @@ else
 	PWD := $(shell pwd)
 default:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+	$(KERNELDIR)/scripts/sign-file sha512 $(KERNELDIR)/certs/signing_key.pem $(KERNELDIR)/certs/signing_key.x509 pref-test.ko
 endif
 
 clean:
