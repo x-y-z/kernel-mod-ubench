@@ -35,14 +35,20 @@ static struct page** end_page = NULL;
 static inline void copy_pages_nocache(struct page *to, struct page *from)
 {
 	char *vfrom, *vto;
+	char *vvfrom, *vvto;
 	int i;
 
-	vfrom = kmap_atomic(from);
-	vto = kmap_atomic(to);
+#ifdef __va_wc 
+	vvfrom = vfrom = kmap_wc_atomic(from);
+	vvto = vto = kmap_wc_atomic(to);
+#else
+	vvfrom = vfrom = kmap_atomic(from);
+	vvto = vto = kmap_atomic(to);
+#endif
 
 	if (boot_cpu_has(X86_FEATURE_AVX2)) {
 		kernel_fpu_begin();
-		for (i = 0; i < 4096/32; i++) {
+		for (i = 0; i < 4096/256; i++) {
 			__asm__ __volatile__ (
 			" vmovntdqa (%0), %%ymm0\n"
 			" vmovntdq  %%ymm0, (%1)\n"
@@ -102,12 +108,18 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 		 */
 		__asm__ __volatile__("sfence \n"::);
 		kernel_fpu_end();
-	} else {
-		pr_info("use copy_page");
+	} else 
+	{
+		/*pr_info("use copy_page");*/
 		copy_page(vto, vfrom);
 	}
-	kunmap_atomic(vto);
-	kunmap_atomic(vfrom);
+#ifdef __va_wc
+	kunmap_wc_atomic(vvto);
+	kunmap_wc_atomic(vvfrom);
+#else
+	kunmap_atomic(vvto);
+	kunmap_atomic(vvfrom);
+#endif
 }
 
 int copy_page_thread(void *data)
@@ -137,7 +149,9 @@ static int __init bench_init(void)
 	int i;
 	/*ulong irqs;*/
 
+#ifndef __va_wc
 	void *vpage;
+#endif
 
 	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
 	if (!memhog_threads)
@@ -152,26 +166,28 @@ static int __init bench_init(void)
 
 
 	for (i = 0; i < nthreads; ++i) {
-		start_page[i] = __alloc_pages_node(node, (GFP_HIGHUSER_MOVABLE |
-									  __GFP_THISNODE), 10);
+		start_page[i] = __alloc_pages_node(node, (GFP_KERNEL|
+									  __GFP_THISNODE) & ~__GFP_RECLAIM, 10);
 
 		if (!start_page[i]) {
 			pr_err("fail to allocate start page in iteration: %d", i);
 			goto out_page;
 		}
-		end_page[i] = __alloc_pages_node(node, (GFP_HIGHUSER_MOVABLE |
-									  __GFP_THISNODE), 10);
+		end_page[i] = __alloc_pages_node(node, (GFP_KERNEL|
+									  __GFP_THISNODE) & ~__GFP_RECLAIM, 10);
 		if (!end_page[i]) {
 			pr_err("fail to allocate end page in iteration: %d", i);
 			goto out_page;
 		}
 	}
 
+#ifndef __va_wc
 	for (i = 0; i < nthreads; ++i) {
 		vpage = kmap_atomic(start_page[i]);
 		set_memory_wc((unsigned long)vpage, 1024);
 		kunmap_atomic(vpage);
 	}
+#endif
 
 
 	for (i = 0; i < nthreads; ++i) {
@@ -207,6 +223,7 @@ out:
 static void __exit bench_exit(void)
 {
 	int i;
+#ifndef __va_wc
 	void *vpage;
 
 	for (i = 0; i < nthreads; ++i) {
@@ -214,6 +231,7 @@ static void __exit bench_exit(void)
 		set_memory_wb((unsigned long)vpage, 1024);
 		kunmap_atomic(vpage);
 	}
+#endif
 
 	for (i = 0; i < nthreads; ++i) {
 		kthread_stop(memhog_threads[i]);
