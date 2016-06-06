@@ -7,6 +7,8 @@
 #include <linux/random.h>
 #include <linux/highmem.h>
 #include <asm/fpu/api.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
@@ -19,8 +21,18 @@ MODULE_LICENSE("GPL");
 
 static int node = 1;
 module_param(node, int, S_IRUGO);
-/*static uint iterations = 1000;*/
-/*module_param(iterations, uint, S_IRUGO);*/
+
+static int use_dma = 0;
+module_param(use_dma, int, S_IRUGO);
+
+static int use_avx = 0;
+module_param(use_avx, int, S_IRUGO);
+
+static int page_order = 10;
+module_param(page_order, int, S_IRUGO);
+
+static int iterations = 8;
+module_param(iterations, int, S_IRUGO);
 
 /*static bool is_tlb_flush = 1;*/
 /*module_param(is_tlb_flush, bool, S_IRUGO);*/
@@ -35,7 +47,7 @@ static struct perf_event_attr tlb_flush_event_attr = {
 	.disabled       = 1,
 };
 
-static void copy_pages(struct page *to, struct page *from)
+static inline void copy_pages(struct page *to, struct page *from)
 {
 	char *vfrom, *vto;
 	/*int i;*/
@@ -48,7 +60,7 @@ static void copy_pages(struct page *to, struct page *from)
 	kunmap_atomic(vto);
 	kunmap_atomic(vfrom);
 }
-static void copy_pages_nocache(struct page *to, struct page *from)
+static inline void copy_pages_nocache(struct page *to, struct page *from)
 {
 	char *vfrom, *vto;
 	int i;
@@ -135,29 +147,48 @@ static int __init bench_init(void)
 {
 	/*volatile char * from;*/
 	/*volatile char * to;*/
-	struct page* start_page[8] = {0};
-	struct page* end_page[8] = {0};
+	struct page* start_page[32] = {0};
+	struct page* end_page[32] = {0};
 	char *third_party = NULL;
 	int cpu;
 	int i, j;
 	ulong irqs;
 	unsigned long idx;
+	u64 begin, end;
 
 	struct perf_event *tlb_flush;
 	void *vpage;
+	struct dma_chan *copy_chan = NULL;
+	struct dma_device *device = NULL;
+	struct dma_async_tx_descriptor *tx = NULL;
+	dma_cookie_t cookie;
+	enum dma_ctrl_flags dma_flags = 0;
+	struct dmaengine_unmap_data *unmap = NULL;
+	dma_cap_mask_t mask;
 
 	u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;
 
-	for (i = 0; i < 8; ++i) {
+	if (page_order < 0)
+		page_order = 0;
+	if (page_order > 10)
+		page_order = 10;
+
+	if (iterations < 1)
+		iterations = 1;
+	if (iterations > 32)
+		iterations = 32;
+
+
+	for (i = 0; i < iterations; ++i) {
 		start_page[i] = __alloc_pages_node(1, (GFP_HIGHUSER_MOVABLE |
-									  __GFP_THISNODE), 10);
+									  __GFP_THISNODE), page_order);
 
 		if (!start_page[i]) {
 			pr_err("fail to allocate start page in iteration: %d", i);
 			goto out_page;
 		}
 		end_page[i] = __alloc_pages_node(0, (GFP_HIGHUSER_MOVABLE |
-									  __GFP_THISNODE), 10);
+									  __GFP_THISNODE), page_order);
 		if (!end_page[i]) {
 			pr_err("fail to allocate end page in iteration: %d", i);
 			goto out_page;
@@ -171,11 +202,26 @@ static int __init bench_init(void)
 		goto out_page;
 	}
 
-	for (i = 0; i < 8; ++i) {
-		vpage = kmap_atomic(start_page[i]);
-		set_memory_wc((unsigned long)vpage, 1024);
-		kunmap_atomic(vpage);
+	if (use_dma) {
+		dma_cap_zero(mask);
+		dma_cap_set(DMA_MEMCPY, mask);
+		dmaengine_get();
+
+		if (!copy_chan)
+			copy_chan = dma_request_channel(mask, NULL, NULL);
+
+		device = copy_chan->device;
+		
+		unmap = dmaengine_get_unmap_data(device->dev, iterations*2, GFP_NOWAIT);
+
+	} else {
+		/*for (i = 0; i < iterations; ++i) {*/
+			/*vpage = kmap_atomic(start_page[i]);*/
+			/*set_memory_wc((unsigned long)vpage, 1<<page_order);*/
+			/*kunmap_atomic(vpage);*/
+		/*}*/
 	}
+
 
 	get_random_bytes((void*)third_party, 32UL*1024*1024);
 
@@ -198,10 +244,57 @@ static int __init bench_init(void)
 	tlb_flushes_1 = perf_event_read_value(tlb_flush, &enabled, &running);
 
 
-	for (i = 0; i < 8; ++i) {
-		for (j = 0; j < 1024; ++j)
-			copy_pages_nocache(end_page[i]+j, start_page[i]+j);
+	if (use_dma) {
+		unmap->to_cnt = iterations;
+
+		for (i = 0; i < iterations; ++i) {
+			unmap->addr[i] = dma_map_page(device->dev, end_page[i], 0, 
+										  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+		}
+
+		unmap->from_cnt = iterations;
+		for (; i < iterations*2; ++i) {
+			unmap->addr[i] = dma_map_page(device->dev, start_page[i-iterations], 0, 
+										  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+		}
+		unmap->len = PAGE_SIZE<<page_order;
+
+		begin = rdtsc();
+
+		for (i = 0; i < iterations; ++i) {
+			tx = device->device_prep_dma_memcpy(copy_chan, unmap->addr[i],
+								unmap->addr[i+iterations], unmap->len, dma_flags);
+			if (!tx) {
+				pr_err("Zi: no tx descriptor");
+				break;
+			}
+			cookie = tx->tx_submit(tx);
+
+			if (dma_submit_error(cookie)) {
+				pr_err("Zi: submit error");
+				break;
+			}
+
+			if (dma_sync_wait(copy_chan, cookie) != DMA_COMPLETE) {
+				pr_err("Zi: dma did not complete");
+			}
+
+		}
+
+		end = rdtsc();
+
+	} else {
+		begin = rdtsc();
+		for (i = 0; i < iterations; ++i) {
+			for (j = 0; j < 1<<page_order; ++j)
+				if (use_avx)
+					copy_pages_nocache(end_page[i]+j, start_page[i]+j);
+				else
+					copy_pages(end_page[i]+j, start_page[i]+j);
+		}
+		end = rdtsc();
 	}
+
 
 
 	/* Read the counters again */
@@ -216,25 +309,38 @@ static int __init bench_init(void)
 	tlb_flushes_3 = perf_event_read_value(tlb_flush, &enabled, &running);
 
 	/* Print results */
-	pr_info("LLC misses: %llu (%llu - %llu)\n",
+	pr_info("Page migration LLC misses: %llu (%llu - %llu)\n",
 		tlb_flushes_2 - tlb_flushes_1,
 		tlb_flushes_2, tlb_flushes_1);
 	/* Print results */
-	pr_info("LLC misses: %llu (%llu - %llu)\n",
+	pr_info("Third party data LLC misses: %llu (%llu - %llu)\n",
 		tlb_flushes_3 - tlb_flushes_2,
 		tlb_flushes_3, tlb_flushes_2);
 
+	pr_info("Page copy time: %llu cycles, %llu ms", (end - begin), (end - begin)/2600000);
+
+
+
 	local_irq_restore(irqs);
+
+	if (use_dma) {
+		dmaengine_unmap_put(unmap);
+		if (copy_chan) {
+			dma_release_channel(copy_chan);
+			copy_chan = NULL;
+		}
+		dmaengine_put();
+	}
 
 	/* Clean up counters */
 	perf_event_disable(tlb_flush);
 
 	perf_event_release_kernel(tlb_flush);
 
-	for (i = 0; i < 8; ++i) {
-		vpage = kmap_atomic(start_page[i]);
-		set_memory_wb((unsigned long)vpage, 1024);
-		kunmap_atomic(vpage);
+	for (i = 0; i < iterations; ++i) {
+		/*vpage = kmap_atomic(start_page[i]);*/
+		/*set_memory_wb((unsigned long)vpage, 1<<page_order);*/
+		/*kunmap_atomic(vpage);*/
 	}
 out_putcpu:
 	/* Enable interrupts */
@@ -244,11 +350,11 @@ out_putcpu:
 	vfree(third_party);
 
 out_page:
-	for (i = 0; i < 8; ++i) {
+	for (i = 0; i < iterations; ++i) {
 		if (end_page[i])
-			__free_pages(end_page[i], 10);
+			__free_pages(end_page[i], page_order);
 		if (start_page[i])
-			__free_pages(start_page[i], 10);
+			__free_pages(start_page[i], page_order);
 	}
 	return 0;
 }
