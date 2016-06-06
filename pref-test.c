@@ -6,6 +6,7 @@
 #include <linux/vmalloc.h>
 #include <linux/random.h>
 #include <linux/highmem.h>
+#include <asm/fpu/api.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
