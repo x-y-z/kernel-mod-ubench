@@ -110,7 +110,6 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 		kernel_fpu_end();
 	} else 
 	{
-		/*pr_info("use copy_page");*/
 		copy_page(vto, vfrom);
 	}
 #ifdef __va_wc
@@ -126,11 +125,22 @@ int copy_page_thread(void *data)
 {
 	int i = *(int*)data;
 	int j;
+	unsigned int cpu_id = 0;
 	const struct cpumask *cpumask = cpumask_of_node(node);
 	struct task_struct *tsk = current;
 
-	if (!cpumask_empty(cpumask))
-		set_cpus_allowed_ptr(tsk, cpumask);
+	cpu_id = cpumask_first(cpumask);
+
+	for (j = 0; j < i; j++)
+		cpu_id = cpumask_next(cpu_id, cpumask);
+
+	if (cpu_id < nr_cpu_ids)
+		set_cpus_allowed_ptr(tsk, cpumask_of(cpu_id));
+	else
+		return 0;
+
+	/*if (!cpumask_empty(cpumask))*/
+		/*set_cpus_allowed_ptr(tsk, cpumask);*/
 
 	while (!kthread_should_stop()) {
 		for (j = 0; j < 1024; ++j)
