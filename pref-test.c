@@ -37,15 +37,16 @@ module_param(iterations, int, S_IRUGO);
 /*static bool is_tlb_flush = 1;*/
 /*module_param(is_tlb_flush, bool, S_IRUGO);*/
 
-static struct perf_event_attr tlb_flush_event_attr = {
-	.type           = PERF_TYPE_RAW,
-	.config         = 0x412e, 
-	/* LLC misses: 0x412e, STLB Flush: 0x20bd, DTLB Flush:0x01bd,
-								 ITLB Flush: 0x01ae */
-	.size           = sizeof(struct perf_event_attr),
-	.pinned         = 1,
-	.disabled       = 1,
-};
+/* LLC misses: 0x412e, STLB Flush: 0x20bd, DTLB Flush:0x01bd,
+							 ITLB Flush: 0x01ae */
+
+/*static struct perf_event_attr tlb_flush_event_attr = {*/
+	/*.type           = PERF_TYPE_RAW,*/
+	/*.config         = 0x412e, */
+	/*.size           = sizeof(struct perf_event_attr),*/
+	/*.pinned         = 1,*/
+	/*.disabled       = 1,*/
+/*};*/
 
 static inline void copy_pages(struct page *to, struct page *from)
 {
@@ -152,12 +153,13 @@ static int __init bench_init(void)
 	char *third_party = NULL;
 	int cpu;
 	int i, j;
+	unsigned long k;
 	ulong irqs;
 	unsigned long idx;
 	u64 begin, end;
 
-	struct perf_event *tlb_flush;
-	void *vpage;
+	/*struct perf_event *tlb_flush;*/
+	char *vpage;
 	struct dma_chan *copy_chan = NULL;
 	struct dma_device *device = NULL;
 	struct dma_async_tx_descriptor *tx = NULL;
@@ -166,7 +168,7 @@ static int __init bench_init(void)
 	struct dmaengine_unmap_data *unmap = NULL;
 	dma_cap_mask_t mask;
 
-	u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;
+	/*u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;*/
 
 	if (page_order < 0)
 		page_order = 0;
@@ -201,6 +203,16 @@ static int __init bench_init(void)
 		pr_err("cannot get third party");
 		goto out_page;
 	}
+	for (i = 0; i < iterations; ++i) {
+		vpage = kmap_atomic(start_page[i]);
+		
+		memset(vpage, 0, PAGE_SIZE<<page_order);
+
+		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE)
+			vpage[k] = i;
+
+		kunmap_atomic(vpage);
+	}
 
 	if (use_dma) {
 		dma_cap_zero(mask);
@@ -228,23 +240,24 @@ static int __init bench_init(void)
 	/* Disable interrupts */
 	cpu = get_cpu();
 	/* Setup TLB miss, and cache miss counters */
-	tlb_flush = perf_event_create_kernel_counter(&tlb_flush_event_attr,
-		cpu, NULL, NULL, NULL);
-	if (IS_ERR(tlb_flush)) {
-		pr_err("Failed to create kernel counter\n");
-		goto out_putcpu;
-	}
+	/*tlb_flush = perf_event_create_kernel_counter(&tlb_flush_event_attr,*/
+		/*cpu, NULL, NULL, NULL);*/
+	/*if (IS_ERR(tlb_flush)) {*/
+		/*pr_err("Failed to create kernel counter\n");*/
+		/*goto out_putcpu;*/
+	/*}*/
 
 	pr_info("get_cpu: %d\n", cpu);
 
-	perf_event_enable(tlb_flush);
+	/*perf_event_enable(tlb_flush);*/
 
 	local_irq_save(irqs);
 	/* Read TLB miss and Cache miss counters */
-	tlb_flushes_1 = perf_event_read_value(tlb_flush, &enabled, &running);
+	/*tlb_flushes_1 = perf_event_read_value(tlb_flush, &enabled, &running);*/
 
 
 	if (use_dma) {
+		begin = rdtsc();
 		unmap->to_cnt = iterations;
 
 		for (i = 0; i < iterations; ++i) {
@@ -259,7 +272,6 @@ static int __init bench_init(void)
 		}
 		unmap->len = PAGE_SIZE<<page_order;
 
-		begin = rdtsc();
 
 		for (i = 0; i < iterations; ++i) {
 			tx = device->device_prep_dma_memcpy(copy_chan, unmap->addr[i],
@@ -298,7 +310,7 @@ static int __init bench_init(void)
 
 
 	/* Read the counters again */
-	tlb_flushes_2 = perf_event_read_value(tlb_flush, &enabled, &running);
+	/*tlb_flushes_2 = perf_event_read_value(tlb_flush, &enabled, &running);*/
 
 
 	for (idx = 16UL*1024*1024; idx < 32UL*1024*1024; idx++) {
@@ -306,18 +318,18 @@ static int __init bench_init(void)
 	}
 
 	/* Read the counters again */
-	tlb_flushes_3 = perf_event_read_value(tlb_flush, &enabled, &running);
+	/*tlb_flushes_3 = perf_event_read_value(tlb_flush, &enabled, &running);*/
 
 	/* Print results */
-	pr_info("Page migration LLC misses: %llu (%llu - %llu)\n",
-		tlb_flushes_2 - tlb_flushes_1,
-		tlb_flushes_2, tlb_flushes_1);
+	/*pr_info("Page migration LLC misses: %llu (%llu - %llu)\n",*/
+		/*tlb_flushes_2 - tlb_flushes_1,*/
+		/*tlb_flushes_2, tlb_flushes_1);*/
 	/* Print results */
-	pr_info("Third party data LLC misses: %llu (%llu - %llu)\n",
-		tlb_flushes_3 - tlb_flushes_2,
-		tlb_flushes_3, tlb_flushes_2);
+	/*pr_info("Third party data LLC misses: %llu (%llu - %llu)\n",*/
+		/*tlb_flushes_3 - tlb_flushes_2,*/
+		/*tlb_flushes_3, tlb_flushes_2);*/
 
-	pr_info("Page copy time: %llu cycles, %llu ms", (end - begin), (end - begin)/2600000);
+	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
 
 
 
@@ -333,16 +345,22 @@ static int __init bench_init(void)
 	}
 
 	/* Clean up counters */
-	perf_event_disable(tlb_flush);
+	/*perf_event_disable(tlb_flush);*/
 
-	perf_event_release_kernel(tlb_flush);
+	/*perf_event_release_kernel(tlb_flush);*/
 
 	for (i = 0; i < iterations; ++i) {
-		/*vpage = kmap_atomic(start_page[i]);*/
+		vpage = kmap_atomic(end_page[i]);
+
+		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
+			if (vpage[k] != i)
+				pr_err("iterations: %d, page offset %lu corrupted", i, k);
+		}
+
 		/*set_memory_wb((unsigned long)vpage, 1<<page_order);*/
-		/*kunmap_atomic(vpage);*/
+		kunmap_atomic(vpage);
 	}
-out_putcpu:
+/*out_putcpu:*/
 	/* Enable interrupts */
 	put_cpu();
 /*out_unmappte:*/
