@@ -159,12 +159,16 @@ static int __init bench_init(void)
 	int cpu;
 	int i, j;
 	unsigned long k;
-	ulong irqs;
+	/*ulong irqs;*/
 	unsigned long idx;
 	u64 begin = 0, end = 0;
+	u64 time_map = 0, time_prepare = 0, time_submit = 0, time_wait = 0;
+	u64 time_wait_all[16] = {0};
+	u64 time_tmp1, time_tmp2;
+	u64 dma_no_wait_begin = 0, dma_no_wait_end = 0;
 
 	/*struct perf_event *tlb_flush;*/
-	char *vpage;
+	char *vpage, *vpage2;
 	struct dma_chan *copy_chan[16] = {0};
 	struct dma_device *device[16] = {0};
 	struct dma_async_tx_descriptor *tx[16] = {0};
@@ -172,6 +176,9 @@ static int __init bench_init(void)
 	enum dma_ctrl_flags dma_flags[16] = {0};
 	struct dmaengine_unmap_data *unmap[16] = {0};
 	dma_cap_mask_t mask[16];
+	int per_channel_iter = 1;
+	int chan_iter;
+	int base_iter_num;
 
 	/*u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;*/
 
@@ -217,11 +224,36 @@ static int __init bench_init(void)
 			vpage[k] = i;
 
 		kunmap_atomic(vpage);
+		vpage2 = kmap_atomic(end_page[i]);
+		memset(vpage2, 0, PAGE_SIZE<<page_order);
+		kunmap_atomic(vpage2);
 	}
 
 	if (use_dma) {
 		if (use_multi_dma) {
+			dmaengine_get();
+			/* not support sub-page DMA for the moment  */
+			per_channel_iter = iterations/use_multi_dma;
+			if (!per_channel_iter) {
+				per_channel_iter = 1;
+				use_multi_dma = iterations;
+			}
+			pr_info("per_channel_iter: %d, use_multi_dma: %d", per_channel_iter, use_multi_dma);
 
+			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter)
+			{
+				dma_cap_zero(mask[chan_iter]);
+				dma_cap_set(DMA_MEMCPY, mask[chan_iter]);
+
+				if (!copy_chan[chan_iter])
+					copy_chan[chan_iter] = dma_request_channel(mask[chan_iter], NULL, NULL);
+				pr_info("Zi: dma %s in use", dma_chan_name(copy_chan[chan_iter]));
+
+				device[chan_iter] = copy_chan[chan_iter]->device;
+				
+				unmap[chan_iter] = dmaengine_get_unmap_data(device[chan_iter]->dev, per_channel_iter*2, GFP_NOWAIT);
+				
+			}
 		} else {
 			dma_cap_zero(mask[0]);
 			dma_cap_set(DMA_MEMCPY, mask[0]);
@@ -260,16 +292,82 @@ static int __init bench_init(void)
 
 	/*perf_event_enable(tlb_flush);*/
 
-	local_irq_save(irqs);
+	/*local_irq_save(irqs);*/
 	/* Read TLB miss and Cache miss counters */
 	/*tlb_flushes_1 = perf_event_read_value(tlb_flush, &enabled, &running);*/
 
 
 	if (use_dma) {
+		dma_no_wait_begin = begin = rdtsc();
 		if (use_multi_dma) {
 
+			time_tmp1 = rdtsc();
+
+			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+				base_iter_num = chan_iter*per_channel_iter;
+
+				unmap[chan_iter]->to_cnt = per_channel_iter;
+
+				for (i = 0; i < per_channel_iter; ++i) {
+					unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, end_page[i+base_iter_num], 0, 
+												  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+				}
+
+				unmap[chan_iter]->from_cnt = per_channel_iter;
+				for (; i < per_channel_iter*2; ++i) {
+					unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, start_page[i-per_channel_iter+base_iter_num], 0, 
+												  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+				}
+				unmap[chan_iter]->len = PAGE_SIZE<<page_order;
+			}
+
+			time_tmp2 = rdtsc();
+			time_map = time_tmp2 - time_tmp1;
+
+
+			for (i = 0; i < per_channel_iter; ++i) {
+				/* submit all work and make sure that they have no error  */
+				time_tmp1 = rdtsc();
+				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+					tx[chan_iter] = device[chan_iter]->device_prep_dma_memcpy(copy_chan[chan_iter], unmap[chan_iter]->addr[i],
+										unmap[chan_iter]->addr[i+per_channel_iter], unmap[chan_iter]->len, dma_flags[chan_iter]);
+					if (!tx[chan_iter]) {
+						pr_err("Zi: no tx descriptor");
+						break;
+					}
+				}
+				time_tmp2 = rdtsc();
+				time_prepare += time_tmp2 - time_tmp1;
+
+				time_tmp1 = rdtsc();
+				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+					cookie[chan_iter] = tx[chan_iter]->tx_submit(tx[chan_iter]);
+
+					if (dma_submit_error(cookie[chan_iter])) {
+						pr_err("Zi: submit error");
+						break;
+					}
+
+					dma_async_issue_pending(copy_chan[chan_iter]);
+				}
+				time_tmp2 = rdtsc();
+				time_submit += time_tmp2 - time_tmp1;
+
+				/* wait for them to finish  */
+				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+				time_tmp1 = rdtsc();
+					if (dma_sync_wait(copy_chan[chan_iter], cookie[chan_iter]) != DMA_COMPLETE) {
+						pr_err("Zi: dma did not complete");
+					}
+				time_tmp2 = rdtsc();
+				time_wait_all[chan_iter] += time_tmp2 - time_tmp1;
+				time_wait += time_tmp2 - time_tmp1;
+				}
+			}
+			
 		} else {
-			begin = rdtsc();
+			time_tmp1 = rdtsc();
+
 			unmap[0]->to_cnt = iterations;
 
 			for (i = 0; i < iterations; ++i) {
@@ -284,30 +382,42 @@ static int __init bench_init(void)
 			}
 			unmap[0]->len = PAGE_SIZE<<page_order;
 
+			time_tmp2 = rdtsc();
+
+			time_map += time_tmp2 - time_tmp1;
 
 			for (i = 0; i < iterations; ++i) {
+				
+				time_tmp1 = rdtsc();
+
 				tx[0] = device[0]->device_prep_dma_memcpy(copy_chan[0], unmap[0]->addr[i],
 									unmap[0]->addr[i+iterations], unmap[0]->len, dma_flags[0]);
 				if (!tx[0]) {
 					pr_err("Zi: no tx descriptor");
 					break;
 				}
+				time_tmp2 = rdtsc();
+				time_prepare += time_tmp2 - time_tmp1;
+
+				time_tmp1 = rdtsc();
 				cookie[0] = tx[0]->tx_submit(tx[0]);
 
 				if (dma_submit_error(cookie[0])) {
 					pr_err("Zi: submit error");
 					break;
 				}
+				time_tmp2 = rdtsc();
+				time_submit += time_tmp2 - time_tmp1;
 
+				time_tmp1 = rdtsc();
 				if (dma_sync_wait(copy_chan[0], cookie[0]) != DMA_COMPLETE) {
 					pr_err("Zi: dma did not complete");
 				}
-
+				time_tmp2 = rdtsc();
+				time_wait += time_tmp2 - time_tmp1;
 			}
-
-			end = rdtsc();
 		}
-
+		end = rdtsc();
 	} else {
 		begin = rdtsc();
 		for (i = 0; i < iterations; ++i) {
@@ -326,9 +436,9 @@ static int __init bench_init(void)
 	/*tlb_flushes_2 = perf_event_read_value(tlb_flush, &enabled, &running);*/
 
 
-	for (idx = 16UL*1024*1024; idx < 32UL*1024*1024; idx++) {
-		third_party[idx] = idx % 10;
-	}
+	/*for (idx = 16UL*1024*1024; idx < 32UL*1024*1024; idx++) {*/
+		/*third_party[idx] = idx % 10;*/
+	/*}*/
 
 	/* Read the counters again */
 	/*tlb_flushes_3 = perf_event_read_value(tlb_flush, &enabled, &running);*/
@@ -342,30 +452,17 @@ static int __init bench_init(void)
 		/*tlb_flushes_3 - tlb_flushes_2,*/
 		/*tlb_flushes_3, tlb_flushes_2);*/
 
-	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
 
 
+	/*local_irq_restore(irqs);*/
 
-	local_irq_restore(irqs);
-
-	if (use_dma) {
-		if (use_multi_dma) {
-
-		} else {
-			dmaengine_unmap_put(unmap[0]);
-			if (copy_chan[0]) {
-				dma_release_channel(copy_chan[0]);
-				copy_chan[0] = NULL;
-			}
-			dmaengine_put();
-		}
-	}
 
 	/* Clean up counters */
 	/*perf_event_disable(tlb_flush);*/
 
 	/*perf_event_release_kernel(tlb_flush);*/
 
+	dma_no_wait_end = rdtsc();
 	for (i = 0; i < iterations; ++i) {
 		vpage = kmap_atomic(end_page[i]);
 
@@ -377,6 +474,36 @@ static int __init bench_init(void)
 		/*set_memory_wb((unsigned long)vpage, 1<<page_order);*/
 		kunmap_atomic(vpage);
 	}
+
+	if (use_dma) {
+		if (use_multi_dma) {
+			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+				dmaengine_unmap_put(unmap[chan_iter]);
+				if (copy_chan[chan_iter]) {
+					dma_release_channel(copy_chan[chan_iter]);
+					copy_chan[chan_iter] = NULL;
+				}
+			}
+			dmaengine_put();
+		} else {
+			dmaengine_unmap_put(unmap[0]);
+			if (copy_chan[0]) {
+				dma_release_channel(copy_chan[0]);
+				copy_chan[0] = NULL;
+			}
+			dmaengine_put();
+		}
+	}
+	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
+	pr_info("Breakdown : map: %llu cycles, %llu microsec", time_map, time_map/2600);
+	pr_info("Breakdown : prepare: %llu cycles, %llu microsec", time_prepare, time_prepare/2600);
+	pr_info("Breakdown : submit: %llu cycles, %llu microsec", time_submit, time_submit/2600);
+	pr_info("Breakdown : wait: %llu cycles, %llu microsec", time_wait, time_wait/2600);
+
+	for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+		pr_info("Channel: %d, wait: %llu cycles, %llu microsec", chan_iter, time_wait_all[chan_iter], time_wait_all[chan_iter]/2600);
+	}
+	pr_info("No wait: %llu cycles, %llu microsec", (dma_no_wait_end - dma_no_wait_begin), (dma_no_wait_end-dma_no_wait_begin)/2600);
 /*out_putcpu:*/
 	/* Enable interrupts */
 	put_cpu();
