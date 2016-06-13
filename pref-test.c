@@ -176,9 +176,11 @@ static int __init bench_init(void)
 	enum dma_ctrl_flags dma_flags[16] = {0};
 	struct dmaengine_unmap_data *unmap[16] = {0};
 	dma_cap_mask_t mask[16];
-	int per_channel_iter = 1;
+	int iterations_per_channel = 1;
+	/*int channels_per_iteration = 1;*/
 	int chan_iter;
 	int base_iter_num;
+	size_t in_page_offset = 0;
 
 	/*u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;*/
 
@@ -233,12 +235,13 @@ static int __init bench_init(void)
 		if (use_multi_dma) {
 			dmaengine_get();
 			/* not support sub-page DMA for the moment  */
-			per_channel_iter = iterations/use_multi_dma;
-			if (!per_channel_iter) {
-				per_channel_iter = 1;
-				use_multi_dma = iterations;
+			iterations_per_channel = iterations/use_multi_dma;
+			if (!iterations_per_channel) {
+				/*iterations_per_channel = 1;*/
+				/*use_multi_dma = iterations;*/
+				iterations_per_channel = - use_multi_dma/iterations;
 			}
-			pr_info("per_channel_iter: %d, use_multi_dma: %d", per_channel_iter, use_multi_dma);
+			pr_info("iterations_per_channel: %d, use_multi_dma: %d", iterations_per_channel, use_multi_dma);
 
 			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter)
 			{
@@ -251,7 +254,7 @@ static int __init bench_init(void)
 
 				device[chan_iter] = copy_chan[chan_iter]->device;
 				
-				unmap[chan_iter] = dmaengine_get_unmap_data(device[chan_iter]->dev, per_channel_iter*2, GFP_NOWAIT);
+				unmap[chan_iter] = dmaengine_get_unmap_data(device[chan_iter]->dev, iterations_per_channel > 0? iterations_per_channel*2:2, GFP_NOWAIT);
 				
 			}
 		} else {
@@ -303,34 +306,51 @@ static int __init bench_init(void)
 
 			time_tmp1 = rdtsc();
 
-			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-				base_iter_num = chan_iter*per_channel_iter;
+			if (iterations_per_channel > 0) {
+				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+					base_iter_num = chan_iter*iterations_per_channel;
 
-				unmap[chan_iter]->to_cnt = per_channel_iter;
+					unmap[chan_iter]->to_cnt = iterations_per_channel;
 
-				for (i = 0; i < per_channel_iter; ++i) {
-					unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, end_page[i+base_iter_num], 0, 
-												  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+					for (i = 0; i < iterations_per_channel; ++i) {
+						unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, end_page[i+base_iter_num], 0, 
+													  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+					}
+
+					unmap[chan_iter]->from_cnt = iterations_per_channel;
+					for (; i < iterations_per_channel*2; ++i) {
+						unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, start_page[i-iterations_per_channel+base_iter_num], 0, 
+													  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+					}
+					unmap[chan_iter]->len = PAGE_SIZE<<page_order;
 				}
+			} else {
+				for (j = 0; j < iterations; ++j) {
+					for (i = 0; i < -iterations_per_channel; ++i) {
+						chan_iter = i + j * (-iterations_per_channel);	
+						in_page_offset = (PAGE_SIZE<<page_order) / (-iterations_per_channel) * i;
 
-				unmap[chan_iter]->from_cnt = per_channel_iter;
-				for (; i < per_channel_iter*2; ++i) {
-					unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, start_page[i-per_channel_iter+base_iter_num], 0, 
-												  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+						unmap[chan_iter]->addr[0] = dma_map_page(device[chan_iter]->dev, end_page[j], in_page_offset,
+													 (PAGE_SIZE<<page_order)/(-iterations_per_channel), DMA_TO_DEVICE);
+						unmap[chan_iter]->addr[1] = dma_map_page(device[chan_iter]->dev, start_page[j], in_page_offset,
+													 (PAGE_SIZE<<page_order)/(-iterations_per_channel), DMA_FROM_DEVICE);
+						unmap[chan_iter]->len = (PAGE_SIZE<<page_order)/(-iterations_per_channel);
+					}
 				}
-				unmap[chan_iter]->len = PAGE_SIZE<<page_order;
 			}
 
 			time_tmp2 = rdtsc();
 			time_map = time_tmp2 - time_tmp1;
 
+			if (iterations_per_channel < 0)
+				iterations_per_channel = 1;
 
-			for (i = 0; i < per_channel_iter; ++i) {
+			for (i = 0; i < iterations_per_channel; ++i) {
 				/* submit all work and make sure that they have no error  */
 				time_tmp1 = rdtsc();
 				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
 					tx[chan_iter] = device[chan_iter]->device_prep_dma_memcpy(copy_chan[chan_iter], unmap[chan_iter]->addr[i],
-										unmap[chan_iter]->addr[i+per_channel_iter], unmap[chan_iter]->len, dma_flags[chan_iter]);
+										unmap[chan_iter]->addr[i+iterations_per_channel], unmap[chan_iter]->len, dma_flags[chan_iter]);
 					if (!tx[chan_iter]) {
 						pr_err("Zi: no tx descriptor");
 						break;
