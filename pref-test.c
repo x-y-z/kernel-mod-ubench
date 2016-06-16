@@ -30,28 +30,17 @@ module_param(nthreads, uint, S_IRUGO);
 
 static struct task_struct **memhog_threads = NULL;
 
-u64 *begin_timestamps = NULL;
+static u64 *begin_timestamps = NULL;
+static unsigned int *cpu_id = NULL;
 
+static int thread_id[32] = {0};
 
 int copy_page_thread(void *data)
 {
 	int i = *(int*)data;
-	int j;
-	unsigned int cpu_id = 0;
-	const struct cpumask *cpumask = cpumask_of_node(node);
-	struct task_struct *tsk = current;
 	u64 current_timestamp;
 
 
-	cpu_id = cpumask_first(cpumask);
-
-	for (j = 0; j < i; j++)
-		cpu_id = cpumask_next(cpu_id, cpumask);
-
-	if (cpu_id < nr_cpu_ids)
-		set_cpus_allowed_ptr(tsk, cpumask_of(cpu_id));
-	else
-		return 0;
 
 	current_timestamp = rdtsc();
 	pr_info("kthread: %d, used %llu cycles, %llu microsec to run",
@@ -64,6 +53,8 @@ int copy_page_thread(void *data)
 static int __init bench_init(void)
 {
 	int i;
+	const struct cpumask *cpumask = cpumask_of_node(node);
+
 
 	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
 	if (!memhog_threads)
@@ -73,20 +64,37 @@ static int __init bench_init(void)
 	if (!begin_timestamps)
 		goto out_free_task;
 
+	cpu_id = kmalloc_node(sizeof(unsigned int)*nthreads, GFP_KERNEL, node);
+
+	cpu_id[0] = cpumask_first(cpumask);
+
+	for (i = 1; i < nthreads; i++) {
+		thread_id[i] = i;
+		cpu_id[i] = cpumask_next(cpu_id[i-1], cpumask);
+
+		if (cpu_id[i] > nr_cpu_ids)
+			goto out_free_timestamp;
+	}
 
 	for (i = 0; i < nthreads; ++i) {
 		begin_timestamps[i] = rdtsc();
-		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &i, node,
+		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
 							"memhog_kernel%d", i);
-		if (!IS_ERR(memhog_threads[i]))
+		kthread_bind(memhog_threads[i], cpu_id[i]);
+		if (!IS_ERR(memhog_threads[i])) {
 			wake_up_process(memhog_threads[i]);
+		}
 		else
 			pr_err("create memhog_threads%d failed", i);
 	}
+	/*for (i = 0; i < nthreads; ++i) {*/
+			/*wake_up_process(memhog_threads[i]);*/
+	/*}*/
 
 	return 0;
 
-
+out_free_timestamp:
+	kfree(begin_timestamps);
 out_free_task:
 	kfree(memhog_threads);
 out:
@@ -100,6 +108,8 @@ static void __exit bench_exit(void)
 		kthread_stop(memhog_threads[i]);
 	}
 	
+	if (cpu_id)
+		kfree(cpu_id);
 	if (begin_timestamps)
 		kfree(begin_timestamps);
 	if (memhog_threads)
