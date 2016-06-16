@@ -43,8 +43,9 @@ int copy_page_thread(void *data)
 
 
 	current_timestamp = rdtsc();
-	pr_info("kthread: %d, used %llu cycles, %llu microsec to run",
-			i, current_timestamp - begin_timestamps[i], 
+	pr_info("kthread: %d at %d, used %llu cycles, %llu microsec to run",
+			i, smp_processor_id(),
+			current_timestamp - begin_timestamps[i], 
 			(current_timestamp - begin_timestamps[i])/2600);
 
 	return 0;
@@ -77,11 +78,11 @@ static int __init bench_init(void)
 	}
 
 	for (i = 0; i < nthreads; ++i) {
-		begin_timestamps[i] = rdtsc();
 		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
 							"memhog_kernel%d", i);
 		kthread_bind(memhog_threads[i], cpu_id[i]);
 		if (!IS_ERR(memhog_threads[i])) {
+			begin_timestamps[i] = rdtsc();
 			wake_up_process(memhog_threads[i]);
 		}
 		else
