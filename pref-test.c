@@ -37,7 +37,21 @@ module_param(iterations, int, S_IRUGO);
 static int use_multi_dma = 0;
 module_param(use_multi_dma, int, S_IRUGO);
 
-
+#if 0
+struct dma_transfer_breakdown {
+	unsigned long long dmaengine_get_cycles;
+	unsigned long long find_dma_chan_cycles;
+	unsigned long long get_unmap_data_cycles;
+	unsigned long long map_pages_cycles;
+	unsigned long long prep_dma_memcpy_cycles;
+	unsigned long long tx_submit_cycles;
+	unsigned long long dma_sync_wait_cycles;
+	unsigned long long put_unmap_data_cycles;
+	unsigned long long release_dma_chan_cycles;
+	unsigned long long dmaengine_put_cycles;
+	unsigned long total_counts;
+};
+#endif
 
 /*static bool is_tlb_flush = 1;*/
 /*module_param(is_tlb_flush, bool, S_IRUGO);*/
@@ -149,6 +163,7 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 	kunmap_atomic(vfrom);
 }
 
+
 static int __init bench_init(void)
 {
 	/*volatile char * from;*/
@@ -160,12 +175,14 @@ static int __init bench_init(void)
 	int i, j;
 	unsigned long k;
 	/*ulong irqs;*/
-	unsigned long idx;
+	/*unsigned long idx;*/
 	u64 begin = 0, end = 0;
 	u64 time_map = 0, time_prepare = 0, time_submit = 0, time_wait = 0;
 	u64 time_wait_all[16] = {0};
 	u64 time_tmp1, time_tmp2;
 	u64 dma_no_wait_begin = 0, dma_no_wait_end = 0;
+
+	struct dma_transfer_breakdown dma_transfer_breakdown = {0};
 
 	/*struct perf_event *tlb_flush;*/
 	char *vpage, *vpage2;
@@ -233,7 +250,13 @@ static int __init bench_init(void)
 
 	if (use_dma) {
 		if (use_multi_dma) {
+			begin = rdtsc();
 			dmaengine_get();
+
+			end = rdtsc();
+			dma_transfer_breakdown.dmaengine_get_cycles = end - begin;
+			begin = end;
+
 			/* not support sub-page DMA for the moment  */
 			iterations_per_channel = iterations/use_multi_dma;
 			if (!iterations_per_channel) {
@@ -257,6 +280,11 @@ static int __init bench_init(void)
 				unmap[chan_iter] = dmaengine_get_unmap_data(device[chan_iter]->dev, iterations_per_channel > 0? iterations_per_channel*2:2, GFP_NOWAIT);
 				
 			}
+
+			end = rdtsc();
+			dma_transfer_breakdown.find_dma_chan_cycles = end - begin;
+			begin = end;
+
 		} else {
 			dma_cap_zero(mask[0]);
 			dma_cap_set(DMA_MEMCPY, mask[0]);
@@ -384,6 +412,11 @@ static int __init bench_init(void)
 				time_wait += time_tmp2 - time_tmp1;
 				}
 			}
+
+			dma_transfer_breakdown.map_pages_cycles = time_map;
+			dma_transfer_breakdown.prep_dma_memcpy_cycles = time_prepare;
+			dma_transfer_breakdown.tx_submit_cycles = time_submit;
+			dma_transfer_breakdown.dma_sync_wait_cycles = time_wait;
 			
 		} else {
 			time_tmp1 = rdtsc();
@@ -497,6 +530,7 @@ static int __init bench_init(void)
 
 	if (use_dma) {
 		if (use_multi_dma) {
+			begin = rdtsc();
 			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
 				dmaengine_unmap_put(unmap[chan_iter]);
 				if (copy_chan[chan_iter]) {
@@ -504,7 +538,15 @@ static int __init bench_init(void)
 					copy_chan[chan_iter] = NULL;
 				}
 			}
+			
+			end = rdtsc();
+			dma_transfer_breakdown.put_unmap_data_cycles = end - begin;
+			begin = end;
+
 			dmaengine_put();
+
+			end = rdtsc();
+			dma_transfer_breakdown.dmaengine_put_cycles = end - begin;
 		} else {
 			dmaengine_unmap_put(unmap[0]);
 			if (copy_chan[0]) {
@@ -515,10 +557,24 @@ static int __init bench_init(void)
 		}
 	}
 	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
+
+	pr_info("Breakdown : dmaengine_get: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.dmaengine_get_cycles , 
+		dma_transfer_breakdown.dmaengine_get_cycles/2600);
+	pr_info("Breakdown : find dma chan & get unmap data: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.find_dma_chan_cycles, 
+		dma_transfer_breakdown.find_dma_chan_cycles/2600);
 	pr_info("Breakdown : map: %llu cycles, %llu microsec", time_map, time_map/2600);
 	pr_info("Breakdown : prepare: %llu cycles, %llu microsec", time_prepare, time_prepare/2600);
 	pr_info("Breakdown : submit: %llu cycles, %llu microsec", time_submit, time_submit/2600);
 	pr_info("Breakdown : wait: %llu cycles, %llu microsec", time_wait, time_wait/2600);
+
+	pr_info("Breakdown : put unmap data & release dma chan: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.put_unmap_data_cycles, 
+		dma_transfer_breakdown.put_unmap_data_cycles/2600);
+	pr_info("Breakdown : dmaengine_put: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.dmaengine_put_cycles , 
+		dma_transfer_breakdown.dmaengine_put_cycles/2600);
 
 	for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
 		pr_info("Channel: %d, wait: %llu cycles, %llu microsec", chan_iter, time_wait_all[chan_iter], time_wait_all[chan_iter]/2600);
