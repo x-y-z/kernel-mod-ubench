@@ -229,11 +229,14 @@ static int __init bench_init(void)
 	kunmap_atomic(vpage);
 
 	sema_init(&copy_page_sem, nthreads);
-	timestamp = rdtsc();
 	for (i = 0; i < nthreads; ++i) {
 		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
 							"memhog_kernel%d", i);
 		kthread_bind(memhog_threads[i], cpu_id[i]);
+	}
+
+	timestamp = rdtsc();
+	for (i = 0; i < nthreads; ++i) {
 		if (!IS_ERR(memhog_threads[i]) && !down_interruptible(&copy_page_sem)) {
 
 			begin_timestamps[i] = rdtsc();
@@ -242,9 +245,6 @@ static int __init bench_init(void)
 		else
 			pr_err("create memhog_threads%d failed", i);
 	}
-	/*for (i = 0; i < nthreads; ++i) {*/
-			/*wake_up_process(memhog_threads[i]);*/
-	/*}*/
 	
 	for (i = 0; i < nthreads; ++i)
 		if (down_interruptible(&copy_page_sem))
