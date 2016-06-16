@@ -29,97 +29,9 @@ module_param(nthreads, uint, S_IRUGO);
 /*module_param(is_tlb_flush, bool, S_IRUGO);*/
 
 static struct task_struct **memhog_threads = NULL;
-static struct page** start_page = NULL;
-static struct page** end_page = NULL;
 
-static inline void copy_pages_nocache(struct page *to, struct page *from)
-{
-	char *vfrom, *vto;
-	char *vvfrom, *vvto;
-	int i;
+u64 *begin_timestamps = NULL;
 
-#ifdef __va_wc 
-	vvfrom = vfrom = kmap_wc_atomic(from);
-	vvto = vto = kmap_wc_atomic(to);
-#else
-	vvfrom = vfrom = kmap_atomic(from);
-	vvto = vto = kmap_atomic(to);
-#endif
-
-	if (boot_cpu_has(X86_FEATURE_AVX2)) {
-		kernel_fpu_begin();
-		for (i = 0; i < 4096/256; i++) {
-			__asm__ __volatile__ (
-			" vmovntdqa (%0), %%ymm0\n"
-			" vmovntdq  %%ymm0, (%1)\n"
-			" vmovntdqa 32(%0), %%ymm1\n"
-			" vmovntdq  %%ymm1, 32(%1)\n"
-			" vmovntdqa 64(%0), %%ymm2\n"
-			" vmovntdq  %%ymm2, 64(%1)\n"
-			" vmovntdqa 96(%0), %%ymm3\n"
-			" vmovntdq  %%ymm3, 96(%1)\n"
-			" vmovntdqa 128(%0), %%ymm4\n"
-			" vmovntdq  %%ymm4, 128(%1)\n"
-			" vmovntdqa 160(%0), %%ymm5\n"
-			" vmovntdq  %%ymm5, 160(%1)\n"
-			" vmovntdqa 192(%0), %%ymm6\n"
-			" vmovntdq  %%ymm6, 192(%1)\n"
-			" vmovntdqa 224(%0), %%ymm7\n"
-			" vmovntdq  %%ymm7, 224(%1)\n"
-				: : "r" (vfrom), "r" (vto) : "memory");
-			vfrom += 256;
-			vto += 256;
-			/*vfrom += 32;*/
-			/*vto += 32;*/
-		}
-		/*
-		 * Since movntq is weakly-ordered, a "sfence" is needed to become
-		 * ordered again:
-		 */
-		__asm__ __volatile__("sfence \n"::);
-		kernel_fpu_end();
-	} else if (boot_cpu_has(X86_FEATURE_AVX)) {
-		kernel_fpu_begin();
-		for (i = 0; i < 4096/128; i++) {
-			__asm__ __volatile__ (
-			" vmovntdqa (%0), %%xmm0\n"
-			" vmovntdq  %%xmm0, (%1)\n"
-			" vmovntdqa 16(%0), %%xmm1\n"
-			" vmovntdq  %%xmm1, 16(%1)\n"
-			" vmovntdqa 32(%0), %%xmm2\n"
-			" vmovntdq  %%xmm2, 32(%1)\n"
-			" vmovntdqa 48(%0), %%xmm3\n"
-			" vmovntdq  %%xmm3, 48(%1)\n"
-			" vmovntdqa 64(%0), %%xmm4\n"
-			" vmovntdq  %%xmm4, 64(%1)\n"
-			" vmovntdqa 80(%0), %%xmm5\n"
-			" vmovntdq  %%xmm5, 80(%1)\n"
-			" vmovntdqa 96(%0), %%xmm6\n"
-			" vmovntdq  %%xmm6, 96(%1)\n"
-			" vmovntdqa 112(%0), %%xmm7\n"
-			" vmovntdq  %%xmm7, 112(%1)\n"
-				: : "r" (vfrom), "r" (vto) : "memory");
-			vfrom += 128;
-			vto += 128;
-		}
-		/*
-		 * Since movntq is weakly-ordered, a "sfence" is needed to become
-		 * ordered again:
-		 */
-		__asm__ __volatile__("sfence \n"::);
-		kernel_fpu_end();
-	} else 
-	{
-		copy_page(vto, vfrom);
-	}
-#ifdef __va_wc
-	kunmap_wc_atomic(vvto);
-	kunmap_wc_atomic(vvfrom);
-#else
-	kunmap_atomic(vvto);
-	kunmap_atomic(vvfrom);
-#endif
-}
 
 int copy_page_thread(void *data)
 {
@@ -128,6 +40,8 @@ int copy_page_thread(void *data)
 	unsigned int cpu_id = 0;
 	const struct cpumask *cpumask = cpumask_of_node(node);
 	struct task_struct *tsk = current;
+	u64 current_timestamp;
+
 
 	cpu_id = cpumask_first(cpumask);
 
@@ -139,68 +53,29 @@ int copy_page_thread(void *data)
 	else
 		return 0;
 
-	/*if (!cpumask_empty(cpumask))*/
-		/*set_cpus_allowed_ptr(tsk, cpumask);*/
-
-	while (!kthread_should_stop()) {
-		for (j = 0; j < 1024; ++j)
-			copy_pages_nocache(end_page[i]+j, start_page[i]+j);
-		/* make watchdog happy  */
-		cond_resched();
-	}
+	current_timestamp = rdtsc();
+	pr_info("kthread: %d, used %llu cycles, %llu microsec to run",
+			i, current_timestamp - begin_timestamps[i], 
+			(current_timestamp - begin_timestamps[i])/2600);
 
 	return 0;
 }
 
 static int __init bench_init(void)
 {
-	/*volatile char * from;*/
-	/*volatile char * to;*/
 	int i;
-	/*ulong irqs;*/
-
-#ifndef __va_wc
-	void *vpage;
-#endif
 
 	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
 	if (!memhog_threads)
 		goto out;
 
-	start_page = kmalloc_node(sizeof(struct page)*nthreads, GFP_KERNEL, node);
-	if (!start_page)
+	begin_timestamps = kmalloc_node(sizeof(u64)*nthreads, GFP_KERNEL, node);
+	if (!begin_timestamps)
 		goto out_free_task;
-	end_page = kmalloc_node(sizeof(struct page)*nthreads, GFP_KERNEL, node);
-	if (!end_page)
-		goto out_free_start;
 
 
 	for (i = 0; i < nthreads; ++i) {
-		start_page[i] = __alloc_pages_node(node, (GFP_KERNEL|
-									  __GFP_THISNODE) & ~__GFP_RECLAIM, 10);
-
-		if (!start_page[i]) {
-			pr_err("fail to allocate start page in iteration: %d", i);
-			goto out_page;
-		}
-		end_page[i] = __alloc_pages_node(node, (GFP_KERNEL|
-									  __GFP_THISNODE) & ~__GFP_RECLAIM, 10);
-		if (!end_page[i]) {
-			pr_err("fail to allocate end page in iteration: %d", i);
-			goto out_page;
-		}
-	}
-
-#ifndef __va_wc
-	for (i = 0; i < nthreads; ++i) {
-		vpage = kmap_atomic(start_page[i]);
-		set_memory_wc((unsigned long)vpage, 1024);
-		kunmap_atomic(vpage);
-	}
-#endif
-
-
-	for (i = 0; i < nthreads; ++i) {
+		begin_timestamps[i] = rdtsc();
 		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &i, node,
 							"memhog_kernel%d", i);
 		if (!IS_ERR(memhog_threads[i]))
@@ -212,18 +87,6 @@ static int __init bench_init(void)
 	return 0;
 
 
-out_page:
-	for (i = 0; i < nthreads; ++i) {
-		if (end_page[i])
-			__free_pages(end_page[i], 10);
-		if (start_page[i])
-			__free_pages(start_page[i], 10);
-	}
-
-	kfree(end_page);
-out_free_start:
-	kfree(start_page);
-
 out_free_task:
 	kfree(memhog_threads);
 out:
@@ -233,33 +96,12 @@ out:
 static void __exit bench_exit(void)
 {
 	int i;
-#ifndef __va_wc
-	void *vpage;
-
-	for (i = 0; i < nthreads; ++i) {
-		vpage = kmap_atomic(start_page[i]);
-		set_memory_wb((unsigned long)vpage, 1024);
-		kunmap_atomic(vpage);
-	}
-#endif
-
 	for (i = 0; i < nthreads; ++i) {
 		kthread_stop(memhog_threads[i]);
 	}
-
-
-
-	for (i = 0; i < nthreads; ++i) {
-		if (end_page[i])
-			__free_pages(end_page[i], 10);
-		if (start_page[i])
-			__free_pages(start_page[i], 10);
-	}
 	
-	if (end_page)
-		kfree(end_page);
-	if (start_page)
-		kfree(start_page);
+	if (begin_timestamps)
+		kfree(begin_timestamps);
 	if (memhog_threads)
 		kfree(memhog_threads);
 	pr_info("Goodbye, world\n");
