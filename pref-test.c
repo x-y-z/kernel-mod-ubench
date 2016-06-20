@@ -179,7 +179,6 @@ int copy_page_thread(void *data)
 
 	up(&copy_page_sem);
 
-	do_exit(0);
 	return 0;
 }
 
@@ -255,14 +254,14 @@ static int __init bench_init(void)
 	}
 
 	sema_init(&copy_page_sem, nthreads);
-	for (i = 0; i < nthreads; ++i) {
+	for (i = 1; i < nthreads; ++i) {
 		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
 							"memhog_kernel%d", i);
 		/*kthread_bind(memhog_threads[i], cpu_id[i]);*/
 	}
 
 	timestamp = rdtsc();
-	for (i = 0; i < nthreads; ++i) {
+	for (i = 1; i < nthreads; ++i) {
 		if (!IS_ERR(memhog_threads[i]) && !down_interruptible(&copy_page_sem)) {
 
 			begin_timestamps[i] = rdtsc();
@@ -271,8 +270,13 @@ static int __init bench_init(void)
 		else
 			pr_err("create memhog_threads%d failed", i);
 	}
+	if (down_interruptible(&copy_page_sem)) {
+		pr_err("something wrong with semaphore");
+	}
+	begin_timestamps[0] = rdtsc();
+	copy_page_thread(&thread_id[0]);
 	
-	for (i = 0; i < nthreads; ++i)
+	for (i = 1; i < nthreads; ++i)
 		if (down_interruptible(&copy_page_sem))
 			pr_err("something wrong with semaphore");
 
@@ -281,7 +285,7 @@ static int __init bench_init(void)
 			page_order, duration, duration/2600);
 
 	/* clean up  */
-	for (i = 0; i < nthreads; ++i)
+	for (i = 1; i < nthreads; ++i)
 		up(&copy_page_sem);
 
 	for (i = 0; i < batch; ++i) {
