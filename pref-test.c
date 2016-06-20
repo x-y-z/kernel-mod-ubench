@@ -29,11 +29,14 @@ module_param(nthreads, uint, S_IRUGO);
 static uint page_order= 10;
 module_param(page_order, uint, S_IRUGO);
 
+static uint batch = 1;
+module_param(batch, uint, S_IRUGO);
+
 /*static bool is_tlb_flush = 1;*/
 /*module_param(is_tlb_flush, bool, S_IRUGO);*/
 
-static struct page* start_page = NULL;
-static struct page* end_page = NULL;
+static struct page** start_page = NULL;
+static struct page** end_page = NULL;
 
 static struct task_struct **memhog_threads = NULL;
 
@@ -142,6 +145,7 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 int copy_page_thread(void *data)
 {
 	int i = *(int*)data;
+	int batch_idx;
 	u64 current_timestamp;
 	char *vfrom, *vto;
 	unsigned long chunk_size = (PAGE_SIZE<<page_order)/nthreads;
@@ -155,16 +159,23 @@ int copy_page_thread(void *data)
 			(current_timestamp - begin_timestamps[i])/2600);
 
 
+	/*vfrom = kmap_atomic(start_page[i]);*/
+	/*vto = kmap_atomic(end_page[i]);*/
 
-	vfrom = kmap_atomic(start_page);
-	vto = kmap_atomic(end_page);
+	/*memcpy(vto, vfrom, PAGE_SIZE<<page_order);*/
 
-	/*for (idx = i*chunk_size; idx < (i+1)*chunk_size; ++idx)*/
-		/*vto[idx] = vfrom[idx];*/
-	memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);
+	/*kunmap_atomic(vto);*/
+	/*kunmap_atomic(vfrom);*/
 
-	kunmap_atomic(vto);
-	kunmap_atomic(vfrom);
+	for (batch_idx = 0; batch_idx < batch; ++batch_idx) {
+		vfrom = kmap_atomic(start_page[batch_idx]);
+		vto = kmap_atomic(end_page[batch_idx]);
+
+		memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);
+
+		kunmap_atomic(vto);
+		kunmap_atomic(vfrom);
+	}
 
 	up(&copy_page_sem);
 
@@ -180,6 +191,8 @@ static int __init bench_init(void)
 	const struct cpumask *cpumask = cpumask_of_node(node);
 	char *vpage;
 	unsigned long k;
+
+	batch = nthreads;
 
 
 	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
@@ -202,37 +215,50 @@ static int __init bench_init(void)
 			goto out_free_timestamp;
 	}
 
-	start_page = __alloc_pages_node(1, (GFP_KERNEL|
-								  __GFP_THISNODE) & ~__GFP_RECLAIM, page_order);
+	start_page = kmalloc_node(sizeof(struct page*)*batch, GFP_KERNEL, node);
+	if (!start_page)
+		goto out_free_page_list;
 
-	if (!start_page) {
-		pr_err("fail to allocate start page in iteration: %d", i);
-		goto out_page;
+	end_page = kmalloc_node(sizeof(struct page*)*batch, GFP_KERNEL, node);
+	if (!end_page)
+		goto out_free_page_list;
+
+
+	for (i = 0; i < batch; ++i) {
+		start_page[i] = __alloc_pages_node(1, (GFP_KERNEL|
+									  __GFP_THISNODE) & ~__GFP_RECLAIM, page_order);
+
+		if (!start_page[i]) {
+			pr_err("fail to allocate start page in iteration: %d", i);
+			goto out_page;
+		}
+		end_page[i] = __alloc_pages_node(0, (GFP_KERNEL|
+									  __GFP_THISNODE) & ~__GFP_RECLAIM, page_order);
+		if (!end_page[i]) {
+			pr_err("fail to allocate end page in iteration: %d", i);
+			goto out_page;
+		}
 	}
-	end_page = __alloc_pages_node(0, (GFP_KERNEL|
-								  __GFP_THISNODE) & ~__GFP_RECLAIM, page_order);
-	if (!end_page) {
-		pr_err("fail to allocate end page in iteration: %d", i);
-		goto out_page;
+
+	for (i = 0; i < batch; ++i) {
+		vpage = kmap_atomic(start_page[i]);
+		
+		memset(vpage, 0, PAGE_SIZE<<page_order);
+
+		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE)
+			vpage[k] = i;
+
+		kunmap_atomic(vpage);
+		vpage = kmap_atomic(end_page[i]);
+		memset(vpage, 0, PAGE_SIZE<<page_order);
+		kunmap_atomic(vpage);
 	}
-
-	vpage = kmap_atomic(start_page);
-	
-	memset(vpage, 0, PAGE_SIZE<<page_order);
-
-	for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE)
-		vpage[k] = 15;
-
-	kunmap_atomic(vpage);
-	vpage = kmap_atomic(end_page);
-	memset(vpage, 0, PAGE_SIZE<<page_order);
-	kunmap_atomic(vpage);
 
 	sema_init(&copy_page_sem, nthreads);
 	for (i = 0; i < nthreads; ++i) {
 		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
 							"memhog_kernel%d", i);
-		kthread_bind(memhog_threads[i], cpu_id[i]);
+		/*kthread_bind(memhog_threads[i], cpu_id[i]);*/
 	}
 
 	timestamp = rdtsc();
@@ -254,47 +280,73 @@ static int __init bench_init(void)
 	pr_info("Page order: %d copy done after %llu cycles, %llu microsec", 
 			page_order, duration, duration/2600);
 
+	/* clean up  */
 	for (i = 0; i < nthreads; ++i)
 		up(&copy_page_sem);
 
-	vpage = kmap_atomic(end_page);
+	for (i = 0; i < batch; ++i) {
+		vpage = kmap_atomic(end_page[i]);
 
-	for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
-		if (vpage[k] != 15)
-			pr_err("page offset %lu corrupted", k);
+		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
+			if (vpage[k] != i)
+				pr_err("page offset %lu corrupted", k);
+		}
+
+		kunmap_atomic(vpage);
 	}
-
-	/*set_memory_wb((unsigned long)vpage, 1<<page_order);*/
-	kunmap_atomic(vpage);
 
 	return 0;
 
 out_page:
+	for (i = 0; i < batch; ++i) {
+		if (end_page[i]) {
+			__free_pages(end_page[i], page_order);
+			end_page[i] = NULL;
+		}
+		if (start_page[i]) {
+			__free_pages(start_page[i], page_order);
+			start_page[i] = NULL;
+		}
+	}
+
+out_free_page_list:
 	if (end_page)
-		__free_pages(end_page, page_order);
+		kfree(end_page);
+	end_page = NULL;
 	if (start_page)
-		__free_pages(start_page, page_order);
+		kfree(start_page);
+	start_page = NULL;
+
 
 out_free_timestamp:
 	kfree(begin_timestamps);
+	begin_timestamps = NULL;
 out_free_task:
 	kfree(memhog_threads);
+	memhog_threads = NULL;
 out:
 	return 0;
 }
 
 static void __exit bench_exit(void)
 {
-	/*int i;*/
+	int i;
 	/*for (i = 0; i < nthreads; ++i) {*/
 		/*if (memhog_threads[i])*/
 			/*kthread_stop(memhog_threads[i]);*/
 	/*}*/
 	
+	for (i = 0; i < batch; ++i) {
+		if (end_page[i])
+			__free_pages(end_page[i], page_order);
+		if (start_page[i])
+			__free_pages(start_page[i], page_order);
+	}
+
 	if (end_page)
-		__free_pages(end_page, page_order);
+		kfree(end_page);
 	if (start_page)
-		__free_pages(start_page, page_order);
+		kfree(start_page);
 
 	if (cpu_id)
 		kfree(cpu_id);
