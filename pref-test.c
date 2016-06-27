@@ -44,7 +44,9 @@ static u64 *begin_timestamps = NULL;
 static unsigned int *cpu_id = NULL;
 
 static int thread_id[32] = {0};
-static DEFINE_SEMAPHORE(copy_page_sem);
+
+static atomic_t finished_threads;
+static DECLARE_WAIT_QUEUE_HEAD(wait_for_other_threads);
 
 static inline void copy_pages(struct page *to, struct page *from)
 {
@@ -159,25 +161,26 @@ int copy_page_thread(void *data)
 			(current_timestamp - begin_timestamps[i])/2600);
 
 
-	/*vfrom = kmap_atomic(start_page[i]);*/
-	/*vto = kmap_atomic(end_page[i]);*/
+	vfrom = kmap_atomic(start_page[i]);
+	vto = kmap_atomic(end_page[i]);
 
-	/*memcpy(vto, vfrom, PAGE_SIZE<<page_order);*/
+	memcpy(vto, vfrom, PAGE_SIZE<<page_order);
 
-	/*kunmap_atomic(vto);*/
-	/*kunmap_atomic(vfrom);*/
+	kunmap_atomic(vto);
+	kunmap_atomic(vfrom);
 
-	for (batch_idx = 0; batch_idx < batch; ++batch_idx) {
-		vfrom = kmap_atomic(start_page[batch_idx]);
-		vto = kmap_atomic(end_page[batch_idx]);
+	/*for (batch_idx = 0; batch_idx < batch; ++batch_idx) {*/
+		/*vfrom = kmap_atomic(start_page[batch_idx]);*/
+		/*vto = kmap_atomic(end_page[batch_idx]);*/
 
-		memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);
+		/*memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);*/
 
-		kunmap_atomic(vto);
-		kunmap_atomic(vfrom);
-	}
+		/*kunmap_atomic(vto);*/
+		/*kunmap_atomic(vfrom);*/
+	/*}*/
 
-	up(&copy_page_sem);
+	atomic_inc(&finished_threads);
+	wake_up(&wait_for_other_threads);
 
 	return 0;
 }
@@ -253,16 +256,16 @@ static int __init bench_init(void)
 		kunmap_atomic(vpage);
 	}
 
-	sema_init(&copy_page_sem, nthreads);
+	atomic_set(&finished_threads, 0);
 	for (i = 1; i < nthreads; ++i) {
 		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
 							"memhog_kernel%d", i);
-		/*kthread_bind(memhog_threads[i], cpu_id[i]);*/
+		kthread_bind(memhog_threads[i], cpu_id[i]);
 	}
 
-	timestamp = rdtsc();
+	begin_timestamps[0] = timestamp = rdtsc();
 	for (i = 1; i < nthreads; ++i) {
-		if (!IS_ERR(memhog_threads[i]) && !down_interruptible(&copy_page_sem)) {
+		if (!IS_ERR(memhog_threads[i])) {
 
 			begin_timestamps[i] = rdtsc();
 			wake_up_process(memhog_threads[i]);
@@ -270,30 +273,21 @@ static int __init bench_init(void)
 		else
 			pr_err("create memhog_threads%d failed", i);
 	}
-	if (down_interruptible(&copy_page_sem)) {
-		pr_err("something wrong with semaphore");
-	}
-	begin_timestamps[0] = rdtsc();
 	copy_page_thread(&thread_id[0]);
 	
-	for (i = 1; i < nthreads; ++i)
-		if (down_interruptible(&copy_page_sem))
-			pr_err("something wrong with semaphore");
+	wait_event(wait_for_other_threads, 
+			   atomic_read(&finished_threads) == nthreads);
 
 	duration = rdtsc() - timestamp;
 	pr_info("Page order: %d copy done after %llu cycles, %llu microsec", 
 			page_order, duration, duration/2600);
-
-	/* clean up  */
-	for (i = 1; i < nthreads; ++i)
-		up(&copy_page_sem);
 
 	for (i = 0; i < batch; ++i) {
 		vpage = kmap_atomic(end_page[i]);
 
 		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
 			if (vpage[k] != i)
-				pr_err("page offset %lu corrupted", k);
+				pr_err("page offset %lu at batch %d corrupted", k, i);
 		}
 
 		kunmap_atomic(vpage);
