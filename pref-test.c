@@ -279,8 +279,8 @@ static int __init bench_init(void)
 			   atomic_read(&finished_threads) == nthreads);
 
 	duration = rdtsc() - timestamp;
-	pr_info("Page order: %d copy done after %llu cycles, %llu microsec", 
-			page_order, duration, duration/2600);
+	pr_info("Page order: %d copy done after %llu cycles, %llu microsec, %d threads", 
+			page_order, duration, duration/2600, nthreads);
 
 	for (i = 0; i < batch; ++i) {
 		vpage = kmap_atomic(end_page[i]);
