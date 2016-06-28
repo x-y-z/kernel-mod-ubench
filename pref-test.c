@@ -342,13 +342,13 @@ static int __init bench_init(void)
 
 					for (i = 0; i < iterations_per_channel; ++i) {
 						unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, end_page[i+base_iter_num], 0, 
-													  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+													  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
 					}
 
 					unmap[chan_iter]->from_cnt = iterations_per_channel;
 					for (; i < iterations_per_channel*2; ++i) {
 						unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, start_page[i-iterations_per_channel+base_iter_num], 0, 
-													  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+													  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
 					}
 					unmap[chan_iter]->len = PAGE_SIZE<<page_order;
 				}
@@ -425,13 +425,13 @@ static int __init bench_init(void)
 
 			for (i = 0; i < iterations; ++i) {
 				unmap[0]->addr[i] = dma_map_page(device[0]->dev, end_page[i], 0, 
-											  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+											  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
 			}
 
 			unmap[0]->from_cnt = iterations;
 			for (; i < iterations*2; ++i) {
 				unmap[0]->addr[i] = dma_map_page(device[0]->dev, start_page[i-iterations], 0, 
-											  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+											  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
 			}
 			unmap[0]->len = PAGE_SIZE<<page_order;
 
