@@ -48,6 +48,23 @@ static int thread_id[32] = {0};
 static atomic_t finished_threads;
 static DECLARE_WAIT_QUEUE_HEAD(wait_for_other_threads);
 
+static noinline void _memcpy(void *to, void *from, size_t n)
+{
+	unsigned long d0, d1, d2;
+	asm volatile("rep ; movsl\n\t"
+		     "testb $2,%b4\n\t"
+		     "je 1f\n\t"
+		     "movsw\n"
+		     "1:\ttestb $1,%b4\n\t"
+		     "je 2f\n\t"
+		     "movsb\n"
+		     "2:"
+		     : "=&c" (d0), "=&D" (d1), "=&S" (d2)
+		     : "0" (n / 4), "q" (n), "1" ((long)to), "2" ((long)from)
+		     : "memory");
+	return;
+}
+
 static inline void copy_pages(struct page *to, struct page *from)
 {
 	char *vfrom, *vto;
@@ -61,13 +78,14 @@ static inline void copy_pages(struct page *to, struct page *from)
 	kunmap_atomic(vto);
 	kunmap_atomic(vfrom);
 }
-static inline void copy_pages_nocache(struct page *to, struct page *from)
+/*static inline void copy_pages_nocache(struct page *to, struct page *from)*/
+static inline void copy_pages_nocache(char *vto, char *vfrom)
 {
-	char *vfrom, *vto;
+	/*char *vfrom, *vto;*/
 	int i;
 
-	vfrom = kmap_atomic(from);
-	vto = kmap_atomic(to);
+	/*vfrom = kmap_atomic(from);*/
+	/*vto = kmap_atomic(to);*/
 	/*copy_page_nocache(vto, vfrom);*/
 
 
@@ -140,44 +158,67 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 		pr_info("use copy_page");
 		copy_page(vto, vfrom);
 	}
-	kunmap_atomic(vto);
-	kunmap_atomic(vfrom);
+	/*kunmap_atomic(vto);*/
+	/*kunmap_atomic(vfrom);*/
 }
 
 int copy_page_thread(void *data)
 {
-	int i = *(int*)data;
+	unsigned long i = *(int*)data;
 	int batch_idx;
-	u64 current_timestamp;
+	u64 current_timestamp, tmp2;
 	char *vfrom, *vto;
 	unsigned long chunk_size = (PAGE_SIZE<<page_order)/nthreads;
+	unsigned long j;
 
 
 
 	current_timestamp = rdtsc();
-	pr_info("kthread: %d at %d, used %llu cycles, %llu microsec to run",
-			i, smp_processor_id(),
-			current_timestamp - begin_timestamps[i], 
-			(current_timestamp - begin_timestamps[i])/2600);
+	/*pr_info("kthread: %lu at %d, used %llu cycles, %llu microsec to run",*/
+			/*i, smp_processor_id(),*/
+			/*current_timestamp - begin_timestamps[i], */
+			/*(current_timestamp - begin_timestamps[i])/2600);*/
 
 
-	vfrom = kmap_atomic(start_page[i]);
-	vto = kmap_atomic(end_page[i]);
+	/*vfrom = kmap_atomic(start_page[i]);*/
+	/*vto = kmap_atomic(end_page[i]);*/
 
-	memcpy(vto, vfrom, PAGE_SIZE<<page_order);
+	/*memcpy(vto, vfrom, PAGE_SIZE<<page_order);*/
 
-	kunmap_atomic(vto);
-	kunmap_atomic(vfrom);
+	/*kunmap_atomic(vto);*/
+	/*kunmap_atomic(vfrom);*/
 
-	/*for (batch_idx = 0; batch_idx < batch; ++batch_idx) {*/
-		/*vfrom = kmap_atomic(start_page[batch_idx]);*/
-		/*vto = kmap_atomic(end_page[batch_idx]);*/
+	/*if (chunk_size > PAGE_SIZE) {*/
+		/*for (batch_idx = 0; batch_idx < batch; ++batch_idx) {*/
+			/*vfrom = kmap_atomic(start_page[batch_idx]);*/
+			/*vto = kmap_atomic(end_page[batch_idx]);*/
 
-		/*memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);*/
+			/*for (j = 0; j < chunk_size; j += PAGE_SIZE)*/
+				/*copy_pages_nocache(&vto[j], &vfrom[j]);*/
+			
 
-		/*kunmap_atomic(vto);*/
-		/*kunmap_atomic(vfrom);*/
+			/*kunmap_atomic(vto);*/
+			/*kunmap_atomic(vfrom);*/
+		/*}*/
+	/*} else {*/
+		for (batch_idx = 0; batch_idx < batch; ++batch_idx) {
+			vfrom = kmap_atomic(start_page[batch_idx]);
+			vto = kmap_atomic(end_page[batch_idx]);
+
+			
+			_memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);
+
+			kunmap_atomic(vto);
+			kunmap_atomic(vfrom);
+		}
 	/*}*/
+
+	tmp2 = rdtsc() - current_timestamp;
+	pr_info("kthread: %lu at %d, used %llu cycles, %llu microsec to finish %lu KB",
+			i, smp_processor_id(),
+			tmp2, 
+			tmp2/2600,
+			chunk_size/1024);
 
 	atomic_inc(&finished_threads);
 	wake_up(&wait_for_other_threads);
@@ -194,8 +235,7 @@ static int __init bench_init(void)
 	char *vpage;
 	unsigned long k;
 
-	batch = nthreads;
-
+	/*batch = nthreads;*/
 
 	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
 	if (!memhog_threads)
@@ -241,6 +281,8 @@ static int __init bench_init(void)
 			goto out_page;
 		}
 	}
+
+	pr_info("start page: %d, end_page: %d, cpus: %d", page_to_nid(start_page[0]), page_to_nid(end_page[0]), node);
 
 	for (i = 0; i < batch; ++i) {
 		vpage = kmap_atomic(start_page[i]);
@@ -335,10 +377,12 @@ static void __exit bench_exit(void)
 	/*}*/
 	
 	for (i = 0; i < batch; ++i) {
-		if (end_page[i])
-			__free_pages(end_page[i], page_order);
-		if (start_page[i])
-			__free_pages(start_page[i], page_order);
+		if (end_page)
+			if (end_page[i])
+				__free_pages(end_page[i], page_order);
+		if (start_page)
+			if (start_page[i])
+				__free_pages(start_page[i], page_order);
 	}
 
 	if (end_page)
