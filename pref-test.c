@@ -39,7 +39,7 @@ module_param(iterations, int, S_IRUGO);
 static int use_multi_dma = 0;
 module_param(use_multi_dma, int, S_IRUGO);
 
-#if 1
+#if 0
 struct dma_transfer_breakdown {
 	unsigned long long dmaengine_get_cycles;
 	unsigned long long find_dma_chan_cycles;
@@ -105,6 +105,8 @@ void dma_work_func(struct work_struct *work)
 		pr_err("Zi: submit error");
 		return;
 	}
+
+	dma_async_issue_pending(copy_chan);
 
 }
 
@@ -379,7 +381,6 @@ static int __init bench_init(void)
 		end = rdtsc();
 		dma_transfer_breakdown.get_unmap_data_cycles = end - begin;
 
-		copy_page_begin = begin = rdtsc();
 
 		if (iterations >= use_multi_dma)
 		{
@@ -407,7 +408,13 @@ static int __init bench_init(void)
 
 				end = rdtsc();
 				dma_transfer_breakdown.map_pages_cycles += end - begin;
+			}
 
+			copy_page_begin = begin = rdtsc();
+
+			for (i = 0; i < total_requests; i++)
+			{
+				chan_iter = i % use_multi_dma;
 
 				INIT_WORK((struct work_struct*)&work_list[i], dma_work_func);
 
@@ -454,6 +461,13 @@ static int __init bench_init(void)
 
 				end = rdtsc();
 				dma_transfer_breakdown.map_pages_cycles += end - begin;
+			}
+
+			copy_page_begin = begin = rdtsc();
+
+			for (i = 0; i < total_requests; i++) 
+			{
+				chan_iter = i % use_multi_dma;
 
 				INIT_WORK((struct work_struct*)&work_list[i], dma_work_func);
 
