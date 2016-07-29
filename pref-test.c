@@ -9,6 +9,8 @@
 #include <asm/fpu/api.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/workqueue.h>
+#include <linux/slab.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
@@ -37,7 +39,7 @@ module_param(iterations, int, S_IRUGO);
 static int use_multi_dma = 0;
 module_param(use_multi_dma, int, S_IRUGO);
 
-#if 0
+#if 1
 struct dma_transfer_breakdown {
 	unsigned long long dmaengine_get_cycles;
 	unsigned long long find_dma_chan_cycles;
@@ -66,6 +68,45 @@ struct dma_transfer_breakdown {
 	/*.pinned         = 1,*/
 	/*.disabled       = 1,*/
 /*};*/
+
+struct dma_work_item {
+	struct work_struct my_work;
+
+	struct dma_chan *copy_chan;
+	struct dma_device *device;
+	struct dma_async_tx_descriptor *tx;
+	dma_cookie_t *cookie;
+	enum dma_ctrl_flags dma_flags;
+	struct dmaengine_unmap_data *unmap;
+	
+};
+
+void dma_work_func(struct work_struct *work)
+{
+	struct dma_work_item *mywork = (struct dma_work_item*)work;
+
+	struct dma_chan *copy_chan = mywork->copy_chan;
+	struct dma_device *device = mywork->device;
+	struct dma_async_tx_descriptor *tx = NULL;
+	dma_cookie_t *cookie = mywork->cookie;
+	enum dma_ctrl_flags dma_flags = 0;
+	struct dmaengine_unmap_data *unmap = mywork->unmap;
+
+
+	tx = device->device_prep_dma_memcpy(copy_chan, unmap->addr[0],
+						unmap->addr[1], unmap->len, dma_flags);
+	if (!tx) {
+		pr_err("Zi: no tx descriptor");
+		return;
+	}
+	*cookie = tx->tx_submit(tx);
+
+	if (dma_submit_error(*cookie)) {
+		pr_err("Zi: submit error");
+		return;
+	}
+
+}
 
 static inline void copy_pages(struct page *to, struct page *from)
 {
@@ -177,10 +218,10 @@ static int __init bench_init(void)
 	/*ulong irqs;*/
 	/*unsigned long idx;*/
 	u64 begin = 0, end = 0;
-	u64 time_map = 0, time_prepare = 0, time_submit = 0, time_wait = 0;
-	u64 time_wait_all[16] = {0};
-	u64 time_tmp1, time_tmp2;
-	u64 dma_no_wait_begin = 0, dma_no_wait_end = 0;
+	/*u64 time_map = 0, time_prepare = 0, time_submit = 0, time_wait = 0;*/
+	/*u64 time_wait_all[16] = {0};*/
+	/*u64 time_tmp1, time_tmp2;*/
+	u64 copy_page_begin = 0, copy_page_end = 0;
 
 	struct dma_transfer_breakdown dma_transfer_breakdown = {0};
 
@@ -188,16 +229,19 @@ static int __init bench_init(void)
 	char *vpage, *vpage2;
 	struct dma_chan *copy_chan[16] = {0};
 	struct dma_device *device[16] = {0};
-	struct dma_async_tx_descriptor *tx[16] = {0};
-	dma_cookie_t cookie[16];
-	enum dma_ctrl_flags dma_flags[16] = {0};
-	struct dmaengine_unmap_data *unmap[16] = {0};
-	dma_cap_mask_t mask[16];
+	dma_cookie_t *cookie = NULL;
+	struct dmaengine_unmap_data **unmap = NULL;
+	dma_cap_mask_t mask;
 	int iterations_per_channel = 1;
 	/*int channels_per_iteration = 1;*/
 	int chan_iter;
-	int base_iter_num;
 	size_t in_page_offset = 0;
+	size_t chunk_size = 0;
+	int page_index = 0;
+	
+	int total_requests = 0;
+
+	struct dma_work_item *work_list = NULL;
 
 	/*u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;*/
 
@@ -249,56 +293,46 @@ static int __init bench_init(void)
 		kunmap_atomic(vpage2);
 	}
 
+
 	if (use_dma) {
-		if (use_multi_dma) {
-			begin = rdtsc();
-			dmaengine_get();
 
-			end = rdtsc();
-			dma_transfer_breakdown.dmaengine_get_cycles = end - begin;
-			begin = end;
+		begin = rdtsc();
 
-			/* not support sub-page DMA for the moment  */
-			iterations_per_channel = iterations/use_multi_dma;
-			if (!iterations_per_channel) {
-				/*iterations_per_channel = 1;*/
-				/*use_multi_dma = iterations;*/
-				iterations_per_channel = - use_multi_dma/iterations;
-			}
-			pr_info("iterations_per_channel: %d, use_multi_dma: %d", iterations_per_channel, use_multi_dma);
+		dma_cap_zero(mask);
+		dma_cap_set(DMA_MEMCPY, mask);
+		dmaengine_get();
 
-			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter)
-			{
-				dma_cap_zero(mask[chan_iter]);
-				dma_cap_set(DMA_MEMCPY, mask[chan_iter]);
+		end = rdtsc();
+		dma_transfer_breakdown.dmaengine_get_cycles = end - begin;
 
-				if (!copy_chan[chan_iter])
-					copy_chan[chan_iter] = dma_request_channel(mask[chan_iter], NULL, NULL);
-				pr_info("Zi: dma %s in use", dma_chan_name(copy_chan[chan_iter]));
-
-				device[chan_iter] = copy_chan[chan_iter]->device;
-				
-				unmap[chan_iter] = dmaengine_get_unmap_data(device[chan_iter]->dev, iterations_per_channel > 0? iterations_per_channel*2:2, GFP_NOWAIT);
-				
-			}
-
-			end = rdtsc();
-			dma_transfer_breakdown.find_dma_chan_cycles = end - begin;
-			begin = end;
-
-		} else {
-			dma_cap_zero(mask[0]);
-			dma_cap_set(DMA_MEMCPY, mask[0]);
-			dmaengine_get();
-
-			if (!copy_chan[0])
-				copy_chan[0] = dma_request_channel(mask[0], NULL, NULL);
-
-			device[0] = copy_chan[0]->device;
+		begin = rdtsc();
+		for (i = 0; i < use_multi_dma; ++i) 
+		{
+			copy_chan[i] = dma_request_channel(mask, NULL, NULL);
 			
-			unmap[0] = dmaengine_get_unmap_data(device[0]->dev, iterations*2, GFP_NOWAIT);
+			if (!copy_chan[i])
+				return -ENODEV;
+
+			device[i] = copy_chan[i]->device;
 		}
 
+		end = rdtsc();
+		dma_transfer_breakdown.find_dma_chan_cycles = end - begin;
+
+		total_requests = max_t(int, iterations, use_multi_dma);
+				
+		if (iterations >= use_multi_dma)	
+			iterations_per_channel = iterations / use_multi_dma;
+		else {
+			iterations_per_channel = 1;
+			chunk_size = iterations * (PAGE_SIZE<<page_order) / use_multi_dma;
+		}
+
+		work_list = kzalloc(sizeof(struct dma_work_item) * total_requests, GFP_NOWAIT);
+
+
+		pr_info("Total request: %d, iterations: %d, use_multi_dma: %d\n",
+				total_requests, iterations, use_multi_dma);
 	} else {
 		/*for (i = 0; i < iterations; ++i) {*/
 			/*vpage = kmap_atomic(start_page[i]);*/
@@ -330,150 +364,126 @@ static int __init bench_init(void)
 
 
 	if (use_dma) {
-		dma_no_wait_begin = begin = rdtsc();
-		if (use_multi_dma) {
-
-			time_tmp1 = rdtsc();
-
-			if (iterations_per_channel > 0) {
-				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-					base_iter_num = chan_iter*iterations_per_channel;
-
-					unmap[chan_iter]->to_cnt = iterations_per_channel;
-
-					for (i = 0; i < iterations_per_channel; ++i) {
-						unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, end_page[i+base_iter_num], 0, 
-													  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
-					}
-
-					unmap[chan_iter]->from_cnt = iterations_per_channel;
-					for (; i < iterations_per_channel*2; ++i) {
-						unmap[chan_iter]->addr[i] = dma_map_page(device[chan_iter]->dev, start_page[i-iterations_per_channel+base_iter_num], 0, 
-													  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
-					}
-					unmap[chan_iter]->len = PAGE_SIZE<<page_order;
-				}
-			} else {
-				for (j = 0; j < iterations; ++j) {
-					for (i = 0; i < -iterations_per_channel; ++i) {
-						chan_iter = i + j * (-iterations_per_channel);	
-						in_page_offset = (PAGE_SIZE<<page_order) / (-iterations_per_channel) * i;
-
-						unmap[chan_iter]->addr[0] = dma_map_page(device[chan_iter]->dev, end_page[j], in_page_offset,
-													 (PAGE_SIZE<<page_order)/(-iterations_per_channel), DMA_TO_DEVICE);
-						unmap[chan_iter]->addr[1] = dma_map_page(device[chan_iter]->dev, start_page[j], in_page_offset,
-													 (PAGE_SIZE<<page_order)/(-iterations_per_channel), DMA_FROM_DEVICE);
-						unmap[chan_iter]->len = (PAGE_SIZE<<page_order)/(-iterations_per_channel);
-					}
-				}
-			}
-
-			time_tmp2 = rdtsc();
-			time_map = time_tmp2 - time_tmp1;
-
-			if (iterations_per_channel < 0)
-				iterations_per_channel = 1;
-
-			for (i = 0; i < iterations_per_channel; ++i) {
-				/* submit all work and make sure that they have no error  */
-				time_tmp1 = rdtsc();
-				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-					tx[chan_iter] = device[chan_iter]->device_prep_dma_memcpy(copy_chan[chan_iter], unmap[chan_iter]->addr[i],
-										unmap[chan_iter]->addr[i+iterations_per_channel], unmap[chan_iter]->len, dma_flags[chan_iter]);
-					if (!tx[chan_iter]) {
-						pr_err("Zi: no tx descriptor");
-						break;
-					}
-				}
-				time_tmp2 = rdtsc();
-				time_prepare += time_tmp2 - time_tmp1;
-
-				time_tmp1 = rdtsc();
-				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-					cookie[chan_iter] = tx[chan_iter]->tx_submit(tx[chan_iter]);
-
-					if (dma_submit_error(cookie[chan_iter])) {
-						pr_err("Zi: submit error");
-						break;
-					}
-
-					dma_async_issue_pending(copy_chan[chan_iter]);
-				}
-				time_tmp2 = rdtsc();
-				time_submit += time_tmp2 - time_tmp1;
-
-				/* wait for them to finish  */
-				for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-				time_tmp1 = rdtsc();
-					if (dma_sync_wait(copy_chan[chan_iter], cookie[chan_iter]) != DMA_COMPLETE) {
-						pr_err("Zi: dma did not complete");
-					}
-				time_tmp2 = rdtsc();
-				time_wait_all[chan_iter] += time_tmp2 - time_tmp1;
-				time_wait += time_tmp2 - time_tmp1;
-				}
-			}
-
-			dma_transfer_breakdown.map_pages_cycles = time_map;
-			dma_transfer_breakdown.prep_dma_memcpy_cycles = time_prepare;
-			dma_transfer_breakdown.tx_submit_cycles = time_submit;
-			dma_transfer_breakdown.dma_sync_wait_cycles = time_wait;
-			
-		} else {
-			time_tmp1 = rdtsc();
-
-			unmap[0]->to_cnt = iterations;
-
-			for (i = 0; i < iterations; ++i) {
-				unmap[0]->addr[i] = dma_map_page(device[0]->dev, end_page[i], 0, 
-											  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
-			}
-
-			unmap[0]->from_cnt = iterations;
-			for (; i < iterations*2; ++i) {
-				unmap[0]->addr[i] = dma_map_page(device[0]->dev, start_page[i-iterations], 0, 
-											  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
-			}
-			unmap[0]->len = PAGE_SIZE<<page_order;
-
-			time_tmp2 = rdtsc();
-
-			time_map += time_tmp2 - time_tmp1;
-
-			for (i = 0; i < iterations; ++i) {
 				
-				time_tmp1 = rdtsc();
+		unmap = kzalloc(sizeof(struct dmaengine_unmap_data*) * total_requests, GFP_NOWAIT);
+		cookie = kzalloc(sizeof(dma_cookie_t) * total_requests, GFP_NOWAIT);
 
-				tx[0] = device[0]->device_prep_dma_memcpy(copy_chan[0], unmap[0]->addr[i],
-									unmap[0]->addr[i+iterations], unmap[0]->len, dma_flags[0]);
-				if (!tx[0]) {
-					pr_err("Zi: no tx descriptor");
-					break;
-				}
-				time_tmp2 = rdtsc();
-				time_prepare += time_tmp2 - time_tmp1;
-
-				time_tmp1 = rdtsc();
-				cookie[0] = tx[0]->tx_submit(tx[0]);
-
-				if (dma_submit_error(cookie[0])) {
-					pr_err("Zi: submit error");
-					break;
-				}
-				time_tmp2 = rdtsc();
-				time_submit += time_tmp2 - time_tmp1;
-
-				time_tmp1 = rdtsc();
-				if (dma_sync_wait(copy_chan[0], cookie[0]) != DMA_COMPLETE) {
-					pr_err("Zi: dma did not complete");
-				}
-				time_tmp2 = rdtsc();
-				time_wait += time_tmp2 - time_tmp1;
-			}
+		begin = rdtsc();
+		for (i = 0; i < total_requests; i++)
+		{
+			chan_iter = total_requests % use_multi_dma;
+			unmap[i] = dmaengine_get_unmap_data(device[chan_iter]->dev, 
+												2,
+												GFP_NOWAIT);
 		}
 		end = rdtsc();
-	} else {
+		dma_transfer_breakdown.get_unmap_data_cycles = end - begin;
+
+		copy_page_begin = begin = rdtsc();
+
+		if (iterations >= use_multi_dma)
+		{
+
+			if (iterations % use_multi_dma != 0)
+			{
+				pr_err("some pages will not be transferred because iterations is not multple of use_multi_dma\n");
+			}
+
+			for (i = 0; i < total_requests; i++)
+			{
+				chan_iter = i % use_multi_dma;
+
+				begin = rdtsc();
+
+				unmap[i]->to_cnt = 1;
+
+				unmap[i]->addr[0] = dma_map_page(device[chan_iter]->dev, end_page[i], 0, 
+											  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+
+				unmap[i]->from_cnt = 1;
+				unmap[i]->addr[1] = dma_map_page(device[chan_iter]->dev, start_page[i], 0, 
+											  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+				unmap[i]->len = PAGE_SIZE<<page_order;
+
+				end = rdtsc();
+				dma_transfer_breakdown.map_pages_cycles += end - begin;
+
+
+				INIT_WORK((struct work_struct*)&work_list[i], dma_work_func);
+
+				work_list[i].copy_chan = copy_chan[chan_iter];
+				work_list[i].device = device[chan_iter];
+				work_list[i].unmap = unmap[i];
+				work_list[i].cookie = &cookie[i];
+
+				queue_work(system_highpri_wq, (struct work_struct*)&work_list[i]);
+			}
+		}
+		else /* iterations < use_multi_dma  */
+		{
+			if (use_multi_dma % iterations != 0)
+			{
+				pr_err("not all pages will be transferred, iterations is not a multiplier of use_multi_dma\n");
+			}
+
+			in_page_offset = 0;
+			page_index = 0;
+			for (i = 0; i < total_requests; i++)
+			{
+				chan_iter = i % use_multi_dma;
+
+				begin = rdtsc();
+
+				unmap[i]->to_cnt = 1;
+
+				unmap[i]->addr[0] = dma_map_page(device[chan_iter]->dev, end_page[page_index], in_page_offset, 
+											  PAGE_SIZE<<page_order, DMA_FROM_DEVICE);
+
+				unmap[i]->from_cnt = 1;
+				unmap[i]->addr[1] = dma_map_page(device[chan_iter]->dev, start_page[page_index], in_page_offset, 
+											  PAGE_SIZE<<page_order, DMA_TO_DEVICE);
+				unmap[chan_iter]->len = chunk_size;
+
+				in_page_offset = in_page_offset + chunk_size;
+
+				if (in_page_offset >= (PAGE_SIZE<<page_order)) {
+					in_page_offset = in_page_offset % (PAGE_SIZE<<page_order);
+
+					page_index += 1;
+				}
+
+				end = rdtsc();
+				dma_transfer_breakdown.map_pages_cycles += end - begin;
+
+				INIT_WORK((struct work_struct*)&work_list[i], dma_work_func);
+
+				work_list[i].copy_chan = copy_chan[chan_iter];
+				work_list[i].device = device[chan_iter];
+				work_list[i].unmap = unmap[i];
+				work_list[i].cookie = &cookie[i];
+
+				queue_work(system_highpri_wq, (struct work_struct*)&work_list[i]);
+
+			}
+		}
+
+		flush_workqueue(system_highpri_wq);
+
 		begin = rdtsc();
+		for (i = 0; i < total_requests; ++i) {
+			/* wait for them to finish  */
+			chan_iter = i % use_multi_dma;
+			if (dma_sync_wait(copy_chan[chan_iter], cookie[i]) != DMA_COMPLETE) {
+				pr_err("Zi: dma did not complete");
+			}
+		}
+		
+		copy_page_end = end = rdtsc();
+		dma_transfer_breakdown.dma_sync_wait_cycles = end - begin;
+
+			
+	} else {
+		copy_page_begin = rdtsc();
 		for (i = 0; i < iterations; ++i) {
 			for (j = 0; j < 1<<page_order; ++j)
 				if (use_avx)
@@ -481,43 +491,14 @@ static int __init bench_init(void)
 				else
 					copy_pages(end_page[i]+j, start_page[i]+j);
 		}
-		end = rdtsc();
+		copy_page_end = rdtsc();
 	}
 
-	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
+	pr_info("Page copy time: %llu cycles, %llu microsec", 
+			(copy_page_end - copy_page_begin), 
+			(copy_page_end - copy_page_begin)/2600);
 
 
-	/* Read the counters again */
-	/*tlb_flushes_2 = perf_event_read_value(tlb_flush, &enabled, &running);*/
-
-
-	/*for (idx = 16UL*1024*1024; idx < 32UL*1024*1024; idx++) {*/
-		/*third_party[idx] = idx % 10;*/
-	/*}*/
-
-	/* Read the counters again */
-	/*tlb_flushes_3 = perf_event_read_value(tlb_flush, &enabled, &running);*/
-
-	/* Print results */
-	/*pr_info("Page migration LLC misses: %llu (%llu - %llu)\n",*/
-		/*tlb_flushes_2 - tlb_flushes_1,*/
-		/*tlb_flushes_2, tlb_flushes_1);*/
-	/* Print results */
-	/*pr_info("Third party data LLC misses: %llu (%llu - %llu)\n",*/
-		/*tlb_flushes_3 - tlb_flushes_2,*/
-		/*tlb_flushes_3, tlb_flushes_2);*/
-
-
-
-	/*local_irq_restore(irqs);*/
-
-
-	/* Clean up counters */
-	/*perf_event_disable(tlb_flush);*/
-
-	/*perf_event_release_kernel(tlb_flush);*/
-
-	dma_no_wait_end = rdtsc();
 	for (i = 0; i < iterations; ++i) {
 		vpage = kmap_atomic(end_page[i]);
 
@@ -531,44 +512,56 @@ static int __init bench_init(void)
 	}
 
 	if (use_dma) {
-		if (use_multi_dma) {
-			begin = rdtsc();
-			for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-				dmaengine_unmap_put(unmap[chan_iter]);
-				if (copy_chan[chan_iter]) {
-					dma_release_channel(copy_chan[chan_iter]);
-					copy_chan[chan_iter] = NULL;
-				}
-			}
-			
-			end = rdtsc();
-			dma_transfer_breakdown.put_unmap_data_cycles = end - begin;
-			begin = end;
 
-			dmaengine_put();
-
-			end = rdtsc();
-			dma_transfer_breakdown.dmaengine_put_cycles = end - begin;
-		} else {
-			dmaengine_unmap_put(unmap[0]);
-			if (copy_chan[0]) {
-				dma_release_channel(copy_chan[0]);
-				copy_chan[0] = NULL;
+		begin = rdtsc();
+		for (i = 0; i < total_requests; ++i)
+			dmaengine_unmap_put(unmap[i]);
+		for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
+			if (copy_chan[chan_iter]) {
+				dma_release_channel(copy_chan[chan_iter]);
+				copy_chan[chan_iter] = NULL;
 			}
-			dmaengine_put();
 		}
+		
+		end = rdtsc();
+		dma_transfer_breakdown.put_unmap_data_cycles = end - begin;
+		begin = end;
+
+		dmaengine_put();
+
+		end = rdtsc();
+		dma_transfer_breakdown.dmaengine_put_cycles = end - begin;
+
+		if (unmap)
+			kfree(unmap);
+		if (cookie)
+			kfree(cookie);
+		if (work_list)
+			kfree(work_list);
 	}
 
 	pr_info("Breakdown : dmaengine_get: %llu cycles, %llu microsec", 
 		dma_transfer_breakdown.dmaengine_get_cycles , 
 		dma_transfer_breakdown.dmaengine_get_cycles/2600);
-	pr_info("Breakdown : find dma chan & get unmap data: %llu cycles, %llu microsec", 
+	pr_info("Breakdown : find dma chan : %llu cycles, %llu microsec", 
 		dma_transfer_breakdown.find_dma_chan_cycles, 
 		dma_transfer_breakdown.find_dma_chan_cycles/2600);
-	pr_info("Breakdown : map: %llu cycles, %llu microsec", time_map, time_map/2600);
-	pr_info("Breakdown : prepare: %llu cycles, %llu microsec", time_prepare, time_prepare/2600);
-	pr_info("Breakdown : submit: %llu cycles, %llu microsec", time_submit, time_submit/2600);
-	pr_info("Breakdown : wait: %llu cycles, %llu microsec", time_wait, time_wait/2600);
+	pr_info("Breakdown : get unmap data: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.get_unmap_data_cycles, 
+		dma_transfer_breakdown.get_unmap_data_cycles/2600);
+
+	pr_info("Breakdown : map: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.map_pages_cycles, 
+		dma_transfer_breakdown.map_pages_cycles/2600);
+	pr_info("Breakdown : prepare: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.prep_dma_memcpy_cycles, 
+		dma_transfer_breakdown.prep_dma_memcpy_cycles/2600);
+	pr_info("Breakdown : submit: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.tx_submit_cycles, 
+		dma_transfer_breakdown.tx_submit_cycles/2600);
+	pr_info("Breakdown : wait: %llu cycles, %llu microsec", 
+		dma_transfer_breakdown.dma_sync_wait_cycles, 
+		dma_transfer_breakdown.dma_sync_wait_cycles/2600);
 
 	pr_info("Breakdown : put unmap data & release dma chan: %llu cycles, %llu microsec", 
 		dma_transfer_breakdown.put_unmap_data_cycles, 
@@ -577,10 +570,9 @@ static int __init bench_init(void)
 		dma_transfer_breakdown.dmaengine_put_cycles , 
 		dma_transfer_breakdown.dmaengine_put_cycles/2600);
 
-	for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {
-		pr_info("Channel: %d, wait: %llu cycles, %llu microsec", chan_iter, time_wait_all[chan_iter], time_wait_all[chan_iter]/2600);
-	}
-	pr_info("No wait: %llu cycles, %llu microsec", (dma_no_wait_end - dma_no_wait_begin), (dma_no_wait_end-dma_no_wait_begin)/2600);
+	/*for (chan_iter = 0; chan_iter < use_multi_dma; ++chan_iter) {*/
+		/*pr_info("Channel: %d, wait: %llu cycles, %llu microsec", chan_iter, time_wait_all[chan_iter], time_wait_all[chan_iter]/2600);*/
+	/*}*/
 /*out_putcpu:*/
 	/* Enable interrupts */
 	put_cpu();
