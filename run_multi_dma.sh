@@ -2,13 +2,19 @@
 
 USE_DMA="1"
 USE_AVX="0"
-PAGE_ORDERS=`seq 0 10`
-ITERATION=16
-NUM_DMA="1 2 4 8 16"
+#PAGE_ORDERS=`seq 0 10`
+#PAGE_ORDERS="0 4 9 12 15 18"
+#PAGE_ORDERS="0 4 8 9 13 17 18"
+PAGE_ORDERS="18"
+ITERATION=1
+#NUM_DMA="1 2 4 8 16"
+NUM_DMA="1"
 
 sudo dmesg -c >/dev/null
 
-for I in `seq 1 2`
+sudo sysctl vm/use_all_dma_chans=0
+
+for I in `seq 1 5`
 do
 	for ORDER in ${PAGE_ORDERS}
 	do
@@ -44,3 +50,4 @@ do
 		#done
 	done
 done
+sudo sysctl vm/use_all_dma_chans=1

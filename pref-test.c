@@ -201,10 +201,10 @@ static int __init bench_init(void)
 
 	/*u64 tlb_flushes_1, tlb_flushes_2, tlb_flushes_3, enabled, running;*/
 
-	if (page_order < 0)
-		page_order = 0;
-	if (page_order > 10)
-		page_order = 10;
+	/*if (page_order < 0)*/
+		/*page_order = 0;*/
+	/*if (page_order > 10)*/
+		/*page_order = 10;*/
 
 	if (iterations < 1)
 		iterations = 1;
@@ -228,6 +228,7 @@ static int __init bench_init(void)
 		}
 	}
 	pr_info("start page: %d, end_page: %d, vmalloc: %d", page_to_nid(start_page[0]), page_to_nid(end_page[0]), node);
+	pr_info("page size: %lu", PAGE_SIZE<<page_order);
 
 	third_party = vmalloc_node(32UL*1024*1024, node);
 	if (!third_party) {
@@ -483,6 +484,7 @@ static int __init bench_init(void)
 		end = rdtsc();
 	}
 
+	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
 
 
 	/* Read the counters again */
@@ -556,7 +558,6 @@ static int __init bench_init(void)
 			dmaengine_put();
 		}
 	}
-	pr_info("Page copy time: %llu cycles, %llu microsec", (end - begin), (end - begin)/2600);
 
 	pr_info("Breakdown : dmaengine_get: %llu cycles, %llu microsec", 
 		dma_transfer_breakdown.dmaengine_get_cycles , 
