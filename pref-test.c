@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/workqueue.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
@@ -38,15 +39,19 @@ module_param(batch, uint, S_IRUGO);
 static struct page** start_page = NULL;
 static struct page** end_page = NULL;
 
-static struct task_struct **memhog_threads = NULL;
 
 static u64 *begin_timestamps = NULL;
 static unsigned int *cpu_id = NULL;
 
 static int thread_id[32] = {0};
 
-static atomic_t finished_threads;
-static DECLARE_WAIT_QUEUE_HEAD(wait_for_other_threads);
+
+struct copy_page_info {
+	struct work_struct copy_page_work;
+	char *to;
+	char *from;
+	unsigned long chunk_size;
+};
 
 static noinline void _memcpy(void *to, void *from, size_t n)
 {
@@ -162,68 +167,14 @@ static inline void copy_pages_nocache(char *vto, char *vfrom)
 	/*kunmap_atomic(vfrom);*/
 }
 
-int copy_page_thread(void *data)
+void copy_page_thread(struct work_struct *work)
 {
-	unsigned long i = *(int*)data;
-	int batch_idx;
-	u64 current_timestamp, tmp2;
-	char *vfrom, *vto;
-	unsigned long chunk_size = (PAGE_SIZE<<page_order)/nthreads;
-	unsigned long j;
+	struct copy_page_info *my_work = (struct copy_page_info*)work;
 
+	_memcpy(my_work->to,
+			my_work->from,
+			my_work->chunk_size);
 
-
-	current_timestamp = rdtsc();
-	/*pr_info("kthread: %lu at %d, used %llu cycles, %llu microsec to run",*/
-			/*i, smp_processor_id(),*/
-			/*current_timestamp - begin_timestamps[i], */
-			/*(current_timestamp - begin_timestamps[i])/2600);*/
-
-
-	/*vfrom = kmap_atomic(start_page[i]);*/
-	/*vto = kmap_atomic(end_page[i]);*/
-
-	/*memcpy(vto, vfrom, PAGE_SIZE<<page_order);*/
-
-	/*kunmap_atomic(vto);*/
-	/*kunmap_atomic(vfrom);*/
-
-	/*if (chunk_size > PAGE_SIZE) {*/
-		/*for (batch_idx = 0; batch_idx < batch; ++batch_idx) {*/
-			/*vfrom = kmap_atomic(start_page[batch_idx]);*/
-			/*vto = kmap_atomic(end_page[batch_idx]);*/
-
-			/*for (j = 0; j < chunk_size; j += PAGE_SIZE)*/
-				/*copy_pages_nocache(&vto[j], &vfrom[j]);*/
-			
-
-			/*kunmap_atomic(vto);*/
-			/*kunmap_atomic(vfrom);*/
-		/*}*/
-	/*} else {*/
-		for (batch_idx = 0; batch_idx < batch; ++batch_idx) {
-			vfrom = kmap_atomic(start_page[batch_idx]);
-			vto = kmap_atomic(end_page[batch_idx]);
-
-			
-			_memcpy(&vto[i*chunk_size], &vfrom[i*chunk_size], chunk_size);
-
-			kunmap_atomic(vto);
-			kunmap_atomic(vfrom);
-		}
-	/*}*/
-
-	tmp2 = rdtsc() - current_timestamp;
-	pr_info("kthread: %lu at %d, used %llu cycles, %llu microsec to finish %lu KB",
-			i, smp_processor_id(),
-			tmp2, 
-			tmp2/2600,
-			chunk_size/1024);
-
-	atomic_inc(&finished_threads);
-	wake_up(&wait_for_other_threads);
-
-	return 0;
 }
 
 static int __init bench_init(void)
@@ -233,17 +184,14 @@ static int __init bench_init(void)
 	u64 duration;
 	const struct cpumask *cpumask = cpumask_of_node(node);
 	char *vpage;
+	char *vfrom, *vto;
 	unsigned long k;
+	int num_work_item = 0;
+	unsigned long chunk_size = (PAGE_SIZE<<page_order)/nthreads;
+	struct copy_page_info *work_items;
 
 	/*batch = nthreads;*/
 
-	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
-	if (!memhog_threads)
-		goto out;
-
-	begin_timestamps = kmalloc_node(sizeof(u64)*nthreads, GFP_KERNEL, node);
-	if (!begin_timestamps)
-		goto out_free_task;
 
 	cpu_id = kmalloc_node(sizeof(unsigned int)*nthreads, GFP_KERNEL, node);
 
@@ -290,50 +238,75 @@ static int __init bench_init(void)
 		memset(vpage, 0, PAGE_SIZE<<page_order);
 
 		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE)
-			vpage[k] = i;
+			vpage[k] = i+1;
+
+		clflush_cache_range(vpage, PAGE_SIZE<<page_order);
 
 		kunmap_atomic(vpage);
 		vpage = kmap_atomic(end_page[i]);
 		memset(vpage, 0, PAGE_SIZE<<page_order);
+		clflush_cache_range(vpage, PAGE_SIZE<<page_order);
 		kunmap_atomic(vpage);
 	}
 
-	atomic_set(&finished_threads, 0);
-	for (i = 1; i < nthreads; ++i) {
-		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &thread_id[i], node,
-							"memhog_kernel%d", i);
-		kthread_bind(memhog_threads[i], cpu_id[i]);
+	num_work_item = nthreads;
+	BUG_ON(batch != 1);
+
+	work_items = kzalloc(sizeof(struct copy_page_info)*num_work_item,
+						 GFP_KERNEL);
+	if (!work_items) {
+		goto out_page;
 	}
 
-	begin_timestamps[0] = timestamp = rdtsc();
-	for (i = 1; i < nthreads; ++i) {
-		if (!IS_ERR(memhog_threads[i])) {
+	pr_info("Zi: chunk_size: %lu\n", chunk_size);
 
-			begin_timestamps[i] = rdtsc();
-			wake_up_process(memhog_threads[i]);
+	vfrom = kmap_atomic(start_page[0]);
+	vto = kmap_atomic(end_page[0]);
+
+	timestamp = rdtsc();
+	if (nthreads == 1) {
+		_memcpy(vto, vfrom, PAGE_SIZE<<page_order);
+	} else {
+		for (i = 0; i < nthreads; ++i) {
+				INIT_WORK((struct work_struct *)&work_items[i], copy_page_thread);
+
+				work_items[i].from = vfrom + chunk_size * i;
+				work_items[i].to = vto + chunk_size * i;
+
+				work_items[i].chunk_size = chunk_size;
+				/* Queue the work on CPUs  */
+				queue_work_on(cpu_id[i], system_highpri_wq, (struct work_struct*)&work_items[i]);
 		}
-		else
-			pr_err("create memhog_threads%d failed", i);
+		
+		/*for (i = 0; i < nthreads; ++i) {*/
+			/*flush_work((struct work_struct*)&work_items[i]);*/
+		/*}*/
+		flush_workqueue(system_highpri_wq);
 	}
-	copy_page_thread(&thread_id[0]);
-	
-	wait_event(wait_for_other_threads, 
-			   atomic_read(&finished_threads) == nthreads);
 
 	duration = rdtsc() - timestamp;
-	pr_info("Page order: %d copy done after %llu cycles, %llu microsec, %d threads", 
+	pr_info("Page order: %d copy done after %llu cycles, %llu microsec, %d threads\n", 
 			page_order, duration, duration/2600, nthreads);
+
+	kunmap_atomic(vto);
+	kunmap_atomic(vfrom);
+
 
 	for (i = 0; i < batch; ++i) {
 		vpage = kmap_atomic(end_page[i]);
 
 		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
-			if (vpage[k] != i)
-				pr_err("page offset %lu at batch %d corrupted", k, i);
+			if (vpage[k] != (char)(i+1)) {
+				pr_err("page offset %lu at batch %d corrupted\n", k, i);
+				break;
+			}
+			
 		}
 
 		kunmap_atomic(vpage);
 	}
+
+	kfree(work_items);
 
 	return 0;
 
@@ -361,20 +334,12 @@ out_free_page_list:
 out_free_timestamp:
 	kfree(begin_timestamps);
 	begin_timestamps = NULL;
-out_free_task:
-	kfree(memhog_threads);
-	memhog_threads = NULL;
-out:
 	return 0;
 }
 
 static void __exit bench_exit(void)
 {
 	int i;
-	/*for (i = 0; i < nthreads; ++i) {*/
-		/*if (memhog_threads[i])*/
-			/*kthread_stop(memhog_threads[i]);*/
-	/*}*/
 	
 	for (i = 0; i < batch; ++i) {
 		if (end_page)
@@ -394,8 +359,6 @@ static void __exit bench_exit(void)
 		kfree(cpu_id);
 	if (begin_timestamps)
 		kfree(begin_timestamps);
-	if (memhog_threads)
-		kfree(memhog_threads);
 	pr_info("Goodbye, world\n");
 }
 
