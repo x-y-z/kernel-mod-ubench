@@ -13,11 +13,15 @@
 
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
-#include <asm/fpu/api.h>
 
-#ifndef CONFIG_X86
-# error "This module only works on X86"
+#ifdef CONFIG_X86
+#include <asm/fpu/api.h>
 #endif
+
+#ifdef CONFIG_PPC64
+#include <asm/time.h>
+#endif
+
 
 MODULE_LICENSE("GPL");
 
@@ -52,6 +56,9 @@ struct copy_page_info {
 	char *from;
 	unsigned long chunk_size;
 };
+
+
+#ifdef CONFIG_X86
 
 static noinline void _memcpy(void *to, void *from, size_t n)
 {
@@ -166,20 +173,38 @@ static inline void copy_pages_nocache(char *vto, char *vfrom)
 	/*kunmap_atomic(vto);*/
 	/*kunmap_atomic(vfrom);*/
 }
+#endif
+
+#if 0
+u64 rdtsc(void)
+{
+    return get_tb();
+}
+#endif
 
 void copy_page_thread(struct work_struct *work)
 {
 	struct copy_page_info *my_work = (struct copy_page_info*)work;
-
+	unsigned long i;
+#ifdef CONFIG_X86
 	_memcpy(my_work->to,
 			my_work->from,
 			my_work->chunk_size);
+#endif
 
+#ifdef CONFIG_PPC64
+	memcpy(my_work->to,
+			my_work->from,
+			my_work->chunk_size);
+        //for (i = 0; i < my_work->chunk_size; i++) {
+	//	my_work->to[i] = my_work->from[i];
+	//}
+#endif
 }
 
 static int __init bench_init(void)
 {
-	int i;
+	int i, j;
 	u64 timestamp;
 	u64 duration;
 	const struct cpumask *cpumask = cpumask_of_node(node);
@@ -189,8 +214,15 @@ static int __init bench_init(void)
 	int num_work_item = 0;
 	unsigned long chunk_size = (PAGE_SIZE<<page_order)/nthreads;
 	struct copy_page_info *work_items;
+        char *pollution;
+	unsigned long pollution_size = 32UL*1024*1024;
 
 	/*batch = nthreads;*/
+
+	pollution = alloc_pages_exact(pollution_size,GFP_KERNEL);
+
+	if (!pollution)
+	    goto out_free_timestamp;
 
 
 	cpu_id = kmalloc_node(sizeof(unsigned int)*nthreads, GFP_KERNEL, node);
@@ -200,9 +232,15 @@ static int __init bench_init(void)
 	for (i = 1; i < nthreads; i++) {
 		thread_id[i] = i;
 		cpu_id[i] = cpumask_next(cpu_id[i-1], cpumask);
+		for (j = 0; j < 7; j++)
+		    cpu_id[i] = cpumask_next(cpu_id[i], cpumask);
 
 		if (cpu_id[i] > nr_cpu_ids)
 			goto out_free_timestamp;
+	}
+
+	for (i = 0; i < nthreads; i++) {
+		pr_info("Thread: %d, at cpu: %d\n", i, cpu_id[i]);
 	}
 
 	start_page = kmalloc_node(sizeof(struct page*)*batch, GFP_KERNEL, node);
@@ -230,24 +268,66 @@ static int __init bench_init(void)
 		}
 	}
 
-	pr_info("start page: %d, end_page: %d, cpus: %d", page_to_nid(start_page[0]), page_to_nid(end_page[0]), node);
+	pr_info("start page: %d, end_page: %d, cpus: %d, size: %ld\n", page_to_nid(start_page[0]), page_to_nid(end_page[0]), node, PAGE_SIZE);
 
 	for (i = 0; i < batch; ++i) {
+		unsigned long start;
+#ifdef CONFIG_X86
 		vpage = kmap_atomic(start_page[i]);
+#endif
 		
+#ifdef CONFIG_PPC64
+		vpage = kmap(start_page[i]);
+#endif
 		memset(vpage, 0, PAGE_SIZE<<page_order);
 
 		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE)
 			vpage[k] = i+1;
-
+#ifdef CONFIG_X86
 		clflush_cache_range(vpage, PAGE_SIZE<<page_order);
+#endif
 
+#ifdef CONFIG_PPC64
+		//__dma_sync(vpage, PAGE_SIZE<<page_order, 0);
+		//for (start = 0; start < (1<<page_order); start++) {
+		//	struct page *one_page = start_page[i] + start;
+		//	flush_dcache_icache_page(one_page);
+		//}
+#endif
+
+#ifdef CONFIG_X86
 		kunmap_atomic(vpage);
 		vpage = kmap_atomic(end_page[i]);
+#endif
+
+#ifdef CONFIG_PPC64
+		kunmap(start_page[i]);
+		vpage = kmap(end_page[i]);
+#endif
 		memset(vpage, 0, PAGE_SIZE<<page_order);
+
+#ifdef CONFIG_X86
 		clflush_cache_range(vpage, PAGE_SIZE<<page_order);
+#endif
+
+#ifdef CONFIG_PPC64
+		//__dma_sync(vpage, PAGE_SIZE<<page_order, 0);
+		//for (start = 0; start < (1<<page_order); start++) {
+		//	struct page *one_page = end_page[i] + start;
+		//	flush_dcache_icache_page(one_page);
+		//}
+#endif
+
+
+#ifdef CONFIG_X86
 		kunmap_atomic(vpage);
+#endif
+#ifdef CONFIG_PPC64
+		kunmap(end_page[i]);
+#endif
 	}
+
+	get_random_bytes(pollution, pollution_size);
 
 	num_work_item = nthreads;
 	BUG_ON(batch != 1);
@@ -260,12 +340,23 @@ static int __init bench_init(void)
 
 	pr_info("Zi: chunk_size: %lu\n", chunk_size);
 
+#ifdef CONFIG_X86
 	vfrom = kmap_atomic(start_page[0]);
 	vto = kmap_atomic(end_page[0]);
+#endif
+#ifdef CONFIG_PPC64
+	vfrom = kmap(start_page[0]);
+	vto = kmap(end_page[0]);
+#endif
 
 	timestamp = rdtsc();
 	if (nthreads == 1) {
+#ifdef CONFIG_X86
 		_memcpy(vto, vfrom, PAGE_SIZE<<page_order);
+#endif
+#ifdef CONFIG_PPC64
+		memcpy(vto, vfrom, PAGE_SIZE<<page_order);
+#endif
 	} else {
 		for (i = 0; i < nthreads; ++i) {
 				INIT_WORK((struct work_struct *)&work_items[i], copy_page_thread);
@@ -278,22 +369,40 @@ static int __init bench_init(void)
 				queue_work_on(cpu_id[i], system_highpri_wq, (struct work_struct*)&work_items[i]);
 		}
 		
-		/*for (i = 0; i < nthreads; ++i) {*/
-			/*flush_work((struct work_struct*)&work_items[i]);*/
-		/*}*/
-		flush_workqueue(system_highpri_wq);
+		for (i = 0; i < nthreads; ++i) {
+			flush_work((struct work_struct*)&work_items[i]);
+		}
+		/*flush_workqueue(system_highpri_wq);*/
 	}
 
 	duration = rdtsc() - timestamp;
+#ifdef CONFIG_PPC64
+	pr_info("Page order: %d copy done after %llu cycles, %llu microsec, %d threads\n", 
+			page_order, duration, tb_to_ns(duration)/1000, nthreads);
+#endif
+
+#ifdef CONFIG_X86
 	pr_info("Page order: %d copy done after %llu cycles, %llu microsec, %d threads\n", 
 			page_order, duration, duration/2600, nthreads);
+#endif
 
+#ifdef CONFIG_X86
 	kunmap_atomic(vto);
 	kunmap_atomic(vfrom);
+#endif
 
+#ifdef CONFIG_PPC64
+	kunmap(start_page[0]);
+	kunmap(end_page[0]);
+#endif
 
 	for (i = 0; i < batch; ++i) {
+#ifdef CONFIG_X86
 		vpage = kmap_atomic(end_page[i]);
+#endif
+#ifdef CONFIG_PPC64
+		vpage = kmap(end_page[i]);
+#endif
 
 		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
 			if (vpage[k] != (char)(i+1)) {
@@ -302,8 +411,12 @@ static int __init bench_init(void)
 			}
 			
 		}
-
+#ifdef CONFIG_X86
 		kunmap_atomic(vpage);
+#endif
+#ifdef CONFIG_PPC64
+		kunmap(end_page[i]);
+#endif
 	}
 
 	kfree(work_items);
@@ -329,6 +442,10 @@ out_free_page_list:
 	if (start_page)
 		kfree(start_page);
 	start_page = NULL;
+
+	if (pollution)
+		free_pages_exact(pollution, pollution_size);
+	pollution = NULL;
 
 
 out_free_timestamp:

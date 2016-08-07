@@ -1,15 +1,18 @@
 #!/bin/bash
 
 #PAGE_ORDERS=`seq 0 10`
-PAGE_ORDERS="0 4 8 9 13 17 18"
+#PAGE_ORDERS="0 4 8 9 13 17 18"
+PAGE_ORDERS="0 4 5 9 13 14"
 
-NUM_MT="1 2 4 8 16"
+NUM_MT="1 2 4 8" #" 16 32 64"
+#NUM_MT="32 64"
 
 STATS_FOLDER="stats_1gb_mov"
 sudo dmesg -c >/dev/null
 
+PAGESIZE=64
 
-for I in `seq 1 5`
+for I in `seq 3 5`
 do
 	for N_MT in ${NUM_MT}
 	do
@@ -23,7 +26,7 @@ do
 			RESULT=`echo ${RESULT} | sed "s/\[.\+\]/time/g"`
 			TIME=`echo ${RESULT} | cut -d" " -f 10`
 			#BANDWIDTH=`echo "scale=5; 4*2^${ORDER}*${N_MT}*10^6/${TIME}/1024/1024" | bc`
-			BANDWIDTH=`echo "scale=5; 4*2^${ORDER}*10^6/${TIME}/1024/1024" | bc`
+			BANDWIDTH=`echo "scale=5; ${PAGESIZE}*2^${ORDER}*10^6/${TIME}/1024/1024" | bc`
 			echo "${BANDWIDTH} GB/s" >>./${STATS_FOLDER}/page_order_${ORDER}_num_mt_${N_MT}
 			else
 			RESULT=`sudo taskset 0x2 insmod pref-test.ko page_order=${ORDER} node=0 nthreads=${N_MT} && sudo rmmod pref_test && sudo dmesg -c | grep "Page order:"`
@@ -31,10 +34,11 @@ do
 			RESULT=`echo ${RESULT} | sed "s/\[.\+\]/time/g"`
 			TIME=`echo ${RESULT} | cut -d" " -f 10`
 			#BANDWIDTH=`echo "scale=5; 4*2^${ORDER}*${N_MT}*10^6/${TIME}/1024/1024" | bc`
-			BANDWIDTH=`echo "scale=5; 4*2^${ORDER}*10^6/${TIME}/1024/1024" | bc`
+			BANDWIDTH=`echo "scale=5; ${PAGESIZE}*2^${ORDER}*10^6/${TIME}/1024/1024" | bc`
 			echo "${BANDWIDTH} GB/s" >>./${STATS_FOLDER}/page_order_${ORDER}_num_mt_${N_MT}
 			fi
 
+			echo "Done"
 			sync
 			sleep 5
 
