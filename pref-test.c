@@ -175,7 +175,7 @@ static inline void copy_pages_nocache(char *vto, char *vfrom)
 }
 #endif
 
-#if 0
+#if 1
 u64 rdtsc(void)
 {
     return get_tb();
@@ -216,8 +216,16 @@ static int __init bench_init(void)
 	struct copy_page_info *work_items;
         char *pollution;
 	unsigned long pollution_size = 32UL*1024*1024;
+	bool subpage = false;
 
 	/*batch = nthreads;*/
+#ifdef CONFIG_PPC64
+	if (page_order > 14) {
+		page_order = 0;
+		chunk_size = 4096;
+		subpage = true;
+	}
+#endif
 
 	pollution = alloc_pages_exact(pollution_size,GFP_KERNEL);
 
@@ -281,7 +289,7 @@ static int __init bench_init(void)
 #endif
 		memset(vpage, 0, PAGE_SIZE<<page_order);
 
-		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE)
+		for (k = 0; k < PAGE_SIZE<<page_order; k += 4096)
 			vpage[k] = i+1;
 #ifdef CONFIG_X86
 		clflush_cache_range(vpage, PAGE_SIZE<<page_order);
@@ -289,10 +297,10 @@ static int __init bench_init(void)
 
 #ifdef CONFIG_PPC64
 		//__dma_sync(vpage, PAGE_SIZE<<page_order, 0);
-		//for (start = 0; start < (1<<page_order); start++) {
-		//	struct page *one_page = start_page[i] + start;
-		//	flush_dcache_icache_page(one_page);
-		//}
+		for (start = 0; start < (1<<page_order); start++) {
+			struct page *one_page = start_page[i] + start;
+			flush_dcache_icache_page(one_page);
+		}
 #endif
 
 #ifdef CONFIG_X86
@@ -312,10 +320,10 @@ static int __init bench_init(void)
 
 #ifdef CONFIG_PPC64
 		//__dma_sync(vpage, PAGE_SIZE<<page_order, 0);
-		//for (start = 0; start < (1<<page_order); start++) {
-		//	struct page *one_page = end_page[i] + start;
-		//	flush_dcache_icache_page(one_page);
-		//}
+		for (start = 0; start < (1<<page_order); start++) {
+			struct page *one_page = end_page[i] + start;
+			flush_dcache_icache_page(one_page);
+		}
 #endif
 
 
@@ -352,10 +360,10 @@ static int __init bench_init(void)
 	timestamp = rdtsc();
 	if (nthreads == 1) {
 #ifdef CONFIG_X86
-		_memcpy(vto, vfrom, PAGE_SIZE<<page_order);
+		_memcpy(vto, vfrom, chunk_size);
 #endif
 #ifdef CONFIG_PPC64
-		memcpy(vto, vfrom, PAGE_SIZE<<page_order);
+		memcpy(vto, vfrom, chunk_size);
 #endif
 	} else {
 		for (i = 0; i < nthreads; ++i) {
@@ -404,11 +412,13 @@ static int __init bench_init(void)
 		vpage = kmap(end_page[i]);
 #endif
 
-		for (k = 0; k < PAGE_SIZE<<page_order; k += PAGE_SIZE) {
+		for (k = 0; k < PAGE_SIZE<<page_order; k += 4096) {
 			if (vpage[k] != (char)(i+1)) {
 				pr_err("page offset %lu at batch %d corrupted\n", k, i);
 				break;
 			}
+			if (subpage)
+				break;
 			
 		}
 #ifdef CONFIG_X86
