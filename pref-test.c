@@ -19,6 +19,7 @@
 
 MODULE_LICENSE("GPL");
 
+/*#undef __va_wc*/
 static int node = 0;
 module_param(node, int, S_IRUGO);
 
@@ -32,23 +33,27 @@ static struct task_struct **memhog_threads = NULL;
 static struct page** start_page = NULL;
 static struct page** end_page = NULL;
 
-static inline void copy_pages_nocache(struct page *to, struct page *from)
+static int thread_id[32] = {0};
+
+static inline void copy_pages_nocache(struct page *to, struct page *from, unsigned long size)
 {
 	char *vfrom, *vto;
 	char *vvfrom, *vvto;
-	int i;
+	unsigned long i;
 
 #ifdef __va_wc 
-	vvfrom = vfrom = kmap_wc_atomic(from);
-	vvto = vto = kmap_wc_atomic(to);
+	vvfrom = vfrom = kmap_wc(from);
+	vvto = vto = kmap_wc(to);
 #else
-	vvfrom = vfrom = kmap_atomic(from);
-	vvto = vto = kmap_atomic(to);
+	vvfrom = vfrom = kmap(from);
+	vvto = vto = kmap(to);
 #endif
+
+	/*pr_info("vfrom: %p, pfn: 0x%lx, vto: %p, pfn: 0x%lx\n", vfrom, page_to_pfn(from), vto, page_to_pfn(to));*/
 
 	if (boot_cpu_has(X86_FEATURE_AVX2)) {
 		kernel_fpu_begin();
-		for (i = 0; i < 4096/256; i++) {
+		for (i = 0; i < size/256; i++) {
 			__asm__ __volatile__ (
 			" vmovntdqa (%0), %%ymm0\n"
 			" vmovntdq  %%ymm0, (%1)\n"
@@ -80,7 +85,7 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 		kernel_fpu_end();
 	} else if (boot_cpu_has(X86_FEATURE_AVX)) {
 		kernel_fpu_begin();
-		for (i = 0; i < 4096/128; i++) {
+		for (i = 0; i < size/128; i++) {
 			__asm__ __volatile__ (
 			" vmovntdqa (%0), %%xmm0\n"
 			" vmovntdq  %%xmm0, (%1)\n"
@@ -113,11 +118,11 @@ static inline void copy_pages_nocache(struct page *to, struct page *from)
 		copy_page(vto, vfrom);
 	}
 #ifdef __va_wc
-	kunmap_wc_atomic(vvto);
-	kunmap_wc_atomic(vvfrom);
+	kunmap_wc(to);
+	kunmap_wc(from);
 #else
-	kunmap_atomic(vvto);
-	kunmap_atomic(vvfrom);
+	kunmap(to);
+	kunmap(from);
 #endif
 }
 
@@ -143,8 +148,7 @@ int copy_page_thread(void *data)
 		/*set_cpus_allowed_ptr(tsk, cpumask);*/
 
 	while (!kthread_should_stop()) {
-		for (j = 0; j < 1024; ++j)
-			copy_pages_nocache(end_page[i]+j, start_page[i]+j);
+		copy_pages_nocache(end_page[i], start_page[i], PAGE_SIZE*1024);
 		/* make watchdog happy  */
 		cond_resched();
 	}
@@ -163,9 +167,14 @@ static int __init bench_init(void)
 	void *vpage;
 #endif
 
-	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, GFP_KERNEL, node);
+	if (nthreads > 16 || nthreads < 0)
+		return 0;
+
+	memhog_threads = kmalloc_node(sizeof(struct task_struct)*nthreads, 
+							GFP_KERNEL, node);
 	if (!memhog_threads)
 		goto out;
+	memset(memhog_threads, 0, sizeof(struct task_struct)*nthreads);
 
 	start_page = kmalloc_node(sizeof(struct page)*nthreads, GFP_KERNEL, node);
 	if (!start_page)
@@ -197,11 +206,15 @@ static int __init bench_init(void)
 		set_memory_wc((unsigned long)vpage, 1024);
 		kunmap_atomic(vpage);
 	}
+	pr_info("Using set_memory_wc\n");
 #endif
 
+	/*pr_info("__va: %p, __va_wc: %p", __va(0), __va_wc(0));*/
 
 	for (i = 0; i < nthreads; ++i) {
-		memhog_threads[i] = kthread_create_on_node(copy_page_thread, &i, node,
+		thread_id[i] = i;
+		memhog_threads[i] = kthread_create_on_node(copy_page_thread, 
+							&thread_id[i], node,
 							"memhog_kernel%d", i);
 		if (!IS_ERR(memhog_threads[i]))
 			wake_up_process(memhog_threads[i]);
@@ -244,7 +257,8 @@ static void __exit bench_exit(void)
 #endif
 
 	for (i = 0; i < nthreads; ++i) {
-		kthread_stop(memhog_threads[i]);
+		if (memhog_threads[i])
+			kthread_stop(memhog_threads[i]);
 	}
 
 
