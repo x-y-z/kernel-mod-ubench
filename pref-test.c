@@ -12,6 +12,7 @@
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
 #include <asm/fpu/api.h>
+#include <asm/set_memory.h>
 
 #ifndef CONFIG_X86
 # error "This module only works on X86"
@@ -202,9 +203,9 @@ static int __init bench_init(void)
 
 #ifndef __va_wc
 	for (i = 0; i < nthreads; ++i) {
-		vpage = kmap_atomic(start_page[i]);
+		vpage = kmap(start_page[i]);
 		set_memory_wc((unsigned long)vpage, 1024);
-		kunmap_atomic(vpage);
+		kunmap(vpage);
 	}
 	pr_info("Using set_memory_wc\n");
 #endif
@@ -250,9 +251,9 @@ static void __exit bench_exit(void)
 	void *vpage;
 
 	for (i = 0; i < nthreads; ++i) {
-		vpage = kmap_atomic(start_page[i]);
+		vpage = kmap(start_page[i]);
 		set_memory_wb((unsigned long)vpage, 1024);
-		kunmap_atomic(vpage);
+		kunmap(vpage);
 	}
 #endif
 
