@@ -20,6 +20,8 @@ static int keep_reading(void *data)
 	while (true) {
 		tmp += *(arg->data);
 		cond_resched();
+		if (kthread_should_stop())
+			break;
 	};
 
 	return 0;
