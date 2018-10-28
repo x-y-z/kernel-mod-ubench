@@ -35,10 +35,12 @@ static int __init bench_init(void)
 	struct page *after_src_page;
 	struct thread_data t_data;
 	struct task_struct *my_kthread;
+	int src_node;
 
 	memset(src_addr, 0, PAGE_SIZE);
 
 	src_page = vmalloc_to_page(src_addr);
+	src_node = page_to_nid(src_page);
 
 	pr_info("before: vaddr: %lx, src: %lx\n", ((unsigned long)src_addr)>>PAGE_SHIFT, page_to_pfn(src_page));
 
@@ -48,7 +50,7 @@ static int __init bench_init(void)
 	my_kthread = kthread_run(keep_reading, &t_data, "test_vmalloc_migration");
 	pr_info("kthread launched\n");
 	
-	migrate_vmalloc_pages(src_addr);
+	migrate_vmalloc_pages(src_addr, NULL, NULL, (src_node + 1) % N_MEMORY);
 	pr_info("migrate done\n");
 
 	after_src_page = vmalloc_to_page(src_addr);
